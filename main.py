@@ -1,172 +1,221 @@
-"""One-shot Alpaca risk-exit job. Designed for Railway Cron, NOT a web server.
+"""V2 SELLER: live-account 10%-profit exits, hourly in regular NYSE hours.
 
-The service exits after each check. Defaults are paper trading and dry-run.
-Only long US stock/ETF positions are eligible for closing.
+Always-on Railway worker (not Railway Cron). 09:35–15:35 Eastern, weekdays;
+Alpaca market clock is the authoritative open/closed check. Long US equities
+only. No buy logic, stop losses, shorts, trailing orders, options or crypto.
+Each sell uses an idempotent per-day client order ID and full held qty.
 """
-
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import re
 import sys
-from decimal import Decimal, InvalidOperation
-from typing import Any
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from zoneinfo import ZoneInfo
 
-LOGGER = logging.getLogger("alpaca-seller-bot")
-STOP_LOSS_PCT = Decimal("-0.05")
-TAKE_PROFIT_PCT = Decimal("0.10")
-MAX_OPEN_ORDER_RESULTS = 500
-
-
-def env_flag(name: str, default: bool) -> bool:
-    """Parse an environment variable strictly to avoid accidental live orders."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"true", "1", "yes", "on"}:
-        return True
-    if value in {"false", "0", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be true or false (received an invalid value)")
+LOG=logging.getLogger("v2-seller")
+NEW_YORK=ZoneInfo("America/New_York")
+TAKE_PROFIT=Decimal("0.10")
+Q9=Decimal("0.000000001")
+SYMBOL=re.compile(r"^[A-Z][A-Z0-9.\\-]{0,10}$")
+MAX_OPEN=500
 
 
-def enum_value(value: Any) -> str:
-    return str(getattr(value, "value", value)).lower()
+def flag(name,default):
+    value=os.getenv(name,str(default)).strip().lower()
+    if value in ("true","yes","1"):return True
+    if value in ("false","no","0"):return False
+    raise ValueError(name+" must be true or false")
 
 
-def exit_reason(unrealized_plpc: Any) -> str | None:
-    """Alpaca reports unrealized_plpc as a fraction: -0.05 == -5%."""
-    if unrealized_plpc is None:
-        return None
+def dec(value):
     try:
-        ratio = Decimal(str(unrealized_plpc))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    if not ratio.is_finite():
-        return None
-    if ratio <= STOP_LOSS_PCT:
-        return "STOP_LOSS"
-    if ratio >= TAKE_PROFIT_PCT:
-        return "TAKE_PROFIT"
-    return None
+        number=Decimal(str(value))
+    except (InvalidOperation,TypeError,ValueError):
+        raise ValueError("Invalid broker numeric position field") from None
+    if not number.is_finite():raise ValueError("Nonfinite broker position field")
+    return number
 
 
-def order_symbols(order: Any) -> set[str]:
-    """Include nested bracket/OTO legs when finding open orders."""
-    symbols: set[str] = set()
-    symbol = getattr(order, "symbol", None)
-    if symbol:
-        symbols.add(str(symbol).upper())
-    for leg in getattr(order, "legs", None) or []:
-        symbols.update(order_symbols(leg))
-    return symbols
+def position_profit_trigger(position)->bool:
+    """Alpaca unrealized_plpc is a fraction of total entry cost, NOT intraday."""
+    try:
+        ratio=dec(getattr(position,"unrealized_plpc",None))
+        cost=dec(getattr(position,"avg_entry_price",None))
+        price=dec(getattr(position,"current_price",None))
+        qty=dec(getattr(position,"qty",None))
+        if qty<=0 or cost<=0 or price<=0:return False
+        # If the broker's ratio and its actual average cost / current-price
+        # disagree, fail closed rather than sell a position at a loss.
+        computed=price/cost-1
+        return ratio>=TAKE_PROFIT and computed>=TAKE_PROFIT
+    except ValueError:return False
 
 
-def run_check(client: Any, dry_run: bool) -> int:
-    """Check positions once and return the number of close requests submitted."""
+def unique_id(day,symbol):
+    if not SYMBOL.fullmatch(symbol):
+        raise ValueError("Unsupported stock ticker")
+    return ("v2s-"+day.replace("-","")+"-"+symbol.replace(".","-"))[:48]
+
+
+def already_submitted(client,cid):
+    from alpaca.common.exceptions import APIError
+    try:
+        return client.get_order_by_client_id(cid) is not None
+    except APIError as exc:
+        if str(getattr(exc,"status_code",""))=="404":
+            return False
+        raise
+
+
+def market_snapshot(client):
     from alpaca.trading.enums import QueryOrderStatus
     from alpaca.trading.requests import GetOrdersRequest
+    account=client.get_account()
+    if (str(getattr(account,"status","")).upper().split(".")[-1]!="ACTIVE"
+        or any(bool(getattr(account,x,False)) for x in (
+            "account_blocked","trading_blocked","trade_suspended_by_user"))):
+        raise RuntimeError("BROKER_ACCOUNT_NOT_ACTIVE")
+    orders=client.get_orders(filter=GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,limit=MAX_OPEN,nested=True))
+    if orders is None or len(orders)>=MAX_OPEN:
+        raise RuntimeError("OPEN_ORDERS_UNVERIFIABLE")
+    occupied=set()
+    def add_order(order):
+        sym=str(getattr(order,"symbol","") or "").upper()
+        if sym:occupied.add(sym)
+        for leg in (getattr(order,"legs",None) or []):
+            add_order(leg)
+    for o in orders:add_order(o)
+    return occupied
 
-    clock = client.get_clock()
+
+def check_once(client,*,dry_run,now=None):
+    from alpaca.trading.enums import OrderSide,TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
+    now=now or datetime.now(timezone.utc)
+    clock=client.get_clock()
     if not clock.is_open:
-        LOGGER.info("Market closed at %s; no position checks or orders", clock.timestamp)
-        return 0
-
-    positions = client.get_all_positions()
-    LOGGER.info("Market open; checking %d position(s); dry_run=%s", len(positions), dry_run)
-    if not positions:
-        return 0
-
-    # Use one consistent snapshot of open orders. If it reaches the API limit,
-    # fail closed rather than risk missing an existing exit order.
-    orders = client.get_orders(
-        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=MAX_OPEN_ORDER_RESULTS, nested=True)
-    )
-    if len(orders) >= MAX_OPEN_ORDER_RESULTS:
-        raise RuntimeError("Too many open orders to verify safely; no close orders submitted")
-
-    blocked_symbols: set[str] = set()
-    for order in orders:
-        blocked_symbols.update(order_symbols(order))
-
-    submissions = 0
-    errors = 0
-    for position in positions:
-        symbol = str(position.symbol).upper()
-        if enum_value(position.asset_class) != "us_equity":
-            LOGGER.info("SKIP %s: not a US stock/ETF (%s)", symbol, enum_value(position.asset_class))
+        LOG.info("V2_SELLER_MARKET_CLOSED")
+        return {"status":"CLOSED","submitted":0,"eligible":0}
+    blocked=market_snapshot(client)
+    positions=client.get_all_positions()
+    if positions is None:raise RuntimeError("BROKER_POSITIONS_UNVERIFIABLE")
+    date=now.astimezone(NEW_YORK).date().isoformat()
+    eligible=0
+    submitted=0
+    previews=0
+    for p in positions:
+        sym=str(getattr(p,"symbol","")).upper()
+        if not SYMBOL.fullmatch(sym):continue
+        cls=str(getattr(getattr(p,"asset_class",None),"value",getattr(p,"asset_class",None))).lower()
+        side=str(getattr(getattr(p,"side",None),"value",getattr(p,"side",None))).lower()
+        if cls!="us_equity" or side!="long":continue
+        if not position_profit_trigger(p):continue
+        eligible+=1
+        if sym in blocked:
+            LOG.info("SELL_SKIP_OPEN_ORDER symbol=%s",sym)
             continue
-        if enum_value(position.side) != "long":
-            LOGGER.info("SKIP %s: not a long position", symbol)
+        cid=unique_id(date,sym)
+        if already_submitted(client,cid):
+            LOG.info("SELL_SKIP_PREVIOUS_ATTEMPT symbol=%s",sym)
             continue
-        pnl_ratio = getattr(position, "unrealized_plpc", None)
-        if not is_valid_decimal(pnl_ratio):
-            LOGGER.warning("SKIP %s: missing/invalid unrealized_plpc=%r", symbol, pnl_ratio)
+        # The market/account/position could change between reads. Verify
+        # the actual current position again before any order write.
+        if not client.get_clock().is_open:
+            LOG.info("V2_SELLER_MARKET_CLOSED_DURING_RUN")
+            break
+        current=client.get_open_position(sym)
+        if (str(getattr(getattr(current,"side",None),"value",getattr(current,"side",None))).lower()!="long"
+            or not position_profit_trigger(current)):
+            LOG.info("SELL_SKIP_GAIN_MOVED symbol=%s",sym)
             continue
-        reason = exit_reason(pnl_ratio)
-        LOGGER.info("CHECK %s qty=%s unrealized_plpc=%s trigger=%s", symbol, position.qty, pnl_ratio, reason or "NONE")
-        if reason is None:
+        if sym in market_snapshot(client):
+            LOG.info("SELL_SKIP_OPEN_ORDER_RECHECK symbol=%s",sym)
             continue
-        if symbol in blocked_symbols:
-            LOGGER.warning("SKIP %s: an open order already exists; do not interfere", symbol)
+        qty=dec(current.qty).quantize(Q9,rounding=ROUND_DOWN)
+        if qty<=0:
+            LOG.info("SELL_SKIP_ZERO_QTY symbol=%s",sym)
             continue
         if dry_run:
-            LOGGER.warning("DRY RUN %s: would close entire position (%s, pnl=%s)", symbol, reason, pnl_ratio)
+            previews+=1
+            LOG.info("SELL_PREVIEW symbol=%s qty=%s broker_gain=%s",
+                     sym,qty,current.unrealized_plpc)
             continue
+        # Limit to exactly one broker POST; on an ambiguous network error
+        # do not retry this run, and reconcile by client ID next cycle.
+        request=MarketOrderRequest(symbol=sym,qty=float(qty),
+            side=OrderSide.SELL,time_in_force=TimeInForce.DAY,
+            client_order_id=cid,extended_hours=False)
         try:
-            # This uses Alpaca's close-position endpoint, which submits an
-            # order to liquidate the ENTIRE position, including fractional qty.
-            order = client.close_position(symbol)
-            blocked_symbols.add(symbol)
-            submissions += 1
-            LOGGER.warning("SUBMITTED %s: %s pnl=%s order_id=%s", symbol, reason, pnl_ratio, order.id)
+            response=client.submit_order(order_data=request)
         except Exception:
-            errors += 1
-            LOGGER.exception("FAILED %s: close order rejected or API unavailable", symbol)
+            LOG.error("SELL_ORDER_UNCERTAIN_ABORT symbol=%s cid=%s",sym,cid)
+            raise RuntimeError("SELL_ORDER_STATUS_UNCERTAIN_NO_RETRY") from None
+        blocked.add(sym)
+        submitted+=1
+        LOG.warning("LIVE_SELL_SENT symbol=%s cid=%s order_id=%s trigger=GAIN_GE_10_PCT",
+                    sym,cid,getattr(response,"id","ACK_PENDING"))
+    LOG.info("SELL_CYCLE_COMPLETE eligible=%d submitted=%d preview=%d",
+             eligible,submitted,previews)
+    return {"status":"OK","eligible":eligible,"submitted":submitted,"preview":previews}
 
-    if errors:
-        raise RuntimeError(f"{errors} close-position request(s) failed; inspect Railway logs")
-    LOGGER.info("Run complete: %d close order(s) submitted", submissions)
-    return submissions
+
+def clients():
+    from alpaca.trading.client import TradingClient
+    key=os.getenv("APCA_API_KEY_ID","").strip()
+    secret=os.getenv("APCA_API_SECRET_KEY","").strip()
+    if not key or not secret:raise ValueError("Missing Alpaca credentials")
+    paper=flag("ALPACA_PAPER",True)
+    dry=flag("DRY_RUN",True)
+    if not paper and not dry and os.getenv("LIVE_TRADING_ACK")!="I_ACCEPT_REAL_MONEY_SELLS":
+        raise ValueError("Live sell orders require explicit LIVE_TRADING_ACK")
+    if flag("ENABLE_LIVE_TRADING",False) and paper:
+        raise ValueError("Live flag must not be paired with paper credentials")
+    if not paper and not dry and not flag("ENABLE_LIVE_TRADING",False):
+        raise ValueError("Live trading must be explicitly enabled")
+    return TradingClient(api_key=key,secret_key=secret,paper=paper),dry,paper
 
 
-def is_valid_decimal(value: Any) -> bool:
+def scheduled_check():
     try:
-        return Decimal(str(value)).is_finite()
-    except (InvalidOperation, TypeError, ValueError):
-        return False
+        trader,dry,paper=clients()
+        status=check_once(trader,dry_run=dry)
+        LOG.info("HOURLY_SELLER_DONE mode=%s dry_run=%s submitted=%d status=%s",
+                 "PAPER" if paper else "LIVE",dry,
+                 status.get("submitted",0),status["status"])
+    except Exception as exc:
+        # Never log credentials or full SDK request bodies.
+        LOG.error("HOURLY_SELLER_FAILED error_type=%s",type(exc).__name__)
 
 
-def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stdout,
-    )
-    try:
-        paper = env_flag("ALPACA_PAPER", True)
-        dry_run = env_flag("DRY_RUN", True)
-        allow_live = env_flag("ENABLE_LIVE_TRADING", False)
-        if not paper and not dry_run and not allow_live:
-            raise ValueError(
-                "Real-money orders are disabled. For live mode set ALPACA_PAPER=false, "
-                "DRY_RUN=false, and ENABLE_LIVE_TRADING=true intentionally."
-            )
-        key = os.getenv("APCA_API_KEY_ID", "").strip()
-        secret = os.getenv("APCA_API_SECRET_KEY", "").strip()
-        if not key or not secret:
-            raise ValueError("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in Railway Variables")
-        from alpaca.trading.client import TradingClient
-
-        client = TradingClient(api_key=key, secret_key=secret, paper=paper)
-        LOGGER.info("Starting one-shot risk check: paper=%s dry_run=%s", paper, dry_run)
-        run_check(client, dry_run=dry_run)
-        return 0
-    except Exception:
-        LOGGER.exception("Job failed")
-        return 1
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-now",action="store_true",
+        help="One read-only preview only; respects Alpaca market-open clock")
+    args=parser.parse_args()
+    logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",stream=sys.stdout)
+    if args.check_now:
+        client,_,_=clients()
+        check_once(client,dry_run=True)
+        return
+    # Validate mode and keys immediately, before claiming service is ready.
+    _,dry,paper=clients()
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    scheduler=BlockingScheduler(timezone=NEW_YORK,
+        job_defaults={"coalesce":True,"max_instances":1,"misfire_grace_time":900})
+    scheduler.add_job(scheduled_check,"cron",day_of_week="mon-fri",
+        hour="9-15",minute=35,id="v2_seller_hourly",
+        replace_existing=True)
+    LOG.info("V2_SELLER_STARTED schedule=09:35..15:35 America/New_York"
+             " every_hour=TRUE no_stop_loss=TRUE mode=%s dry_run=%s",
+             "PAPER" if paper else "LIVE",dry)
+    scheduler.start()
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":
+    main()

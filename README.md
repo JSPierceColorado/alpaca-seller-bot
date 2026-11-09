@@ -1,75 +1,56 @@
-# Alpaca Seller Bot (Railway Cron)
+# V2 Seller — Hourly take-profit-only Alpaca bot
 
-A **one-shot** sell-only exit checker for **long U.S. stock/ETF positions** in an Alpaca Trading account. It checks every held U.S. stock/ETF during normal U.S. equity market hours using Alpaca's market clock, and submits an order to close the **entire position** when the reported total unrealized return reaches either threshold:
+Run the original simple **long-only 10%-profit seller** on an Alpaca account.
+It checks held US stock/ETF positions at **9:35, 10:35, 11:35, 12:35, 1:35,
+2:35, and 3:35 p.m./a.m. Eastern as applicable** (09:35–15:35 NY time),
+Monday–Friday. The NYSE clock prevents weekend, holiday and early-close
+trades. APScheduler is the **internal persistent scheduler**; there is no
+Railway Cron. The Railway service is restarted automatically if its process fails.
 
-- **Stop loss:** `unrealized_plpc <= -0.05` (loss of 5% or more)
-- **Take profit:** `unrealized_plpc >= 0.10` (gain of 10% or more)
+## Strategy
 
-`unrealized_plpc` is Alpaca's fraction based on the position's **average entry price**, not today's price change. Thresholds are fixed in `main.py`. The bot does not open positions or place buy orders. It ignores options, crypto, and short positions; it does not cancel open orders. It skips a position if any open order already exists for that symbol, to avoid order conflicts.
+- Look at long US-equity positions across the configured account.
+- Sell **only if the position's total unrealized gain is at least 10%** as
+  reported by Alpaca and as separately calculated from average entry and
+  current broker price.
+- Submit a normal market **DAY SELL** for all held fractional or whole shares.
+- **No stop losses at any level, no trailing stops, no shorts, no buys.**
+  Losing and sub-10%-gain positions are held.
+- Skip if any open order exists for a position (including nested legs).
+- Recheck market clock, position and open orders immediately before sending.
+- Broker `client_order_id` is stable for the day and symbol:
+  `v2s-YYYYMMDD-SYMBOL`. Before sending, query Alpaca for that ID.
+  Network uncertainty aborts the current cycle without blind retries.
+- Uses Alpaca market orders; fills may differ from checked prices.
+  **A 10% reported gain does NOT guarantee 10% realized profit** after
+  slippage, spread or a price move before execution. This is an hourly
+  trigger, not constant price monitoring.
 
-**Important:** This is NOT an exchange-held stop order or a real-time price monitor. Checks can be late, markets can gap, Alpaca quote/position updates can lag, market orders can slip, and execution/fills are not guaranteed. A 10-minute interval can miss a stop or fill at a substantially worse price. Consider native Alpaca stop/bracket orders if you need protection between checks.
+## Railway
 
-## Files
+- Source: `JSPierceColorado/alpaca-seller-bot`, branch `main`
+- Service: `V2-Seller` in Investing
+- Always-on worker, one replica, `python -u main.py`, Railway Cron disabled,
+  restart policy `ALWAYS`.
+- `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` from your Alpaca credentials.
+- `ALPACA_PAPER=false` for the actual live brokerage account.
+- `DRY_RUN=false` to submit real sells.
+- `ENABLE_LIVE_TRADING=true` plus exact
+  `LIVE_TRADING_ACK=I_ACCEPT_REAL_MONEY_SELLS` required for real-money orders.
+- `LOG_LEVEL=INFO` for operational logs.
+- No Google service account required for the seller.
 
-- `main.py`: a single poll-and-exit run; market clock, thresholds, safe filtering, open-order guard, close-position requests, logging.
-- `requirements.txt`: pins Alpaca's Python SDK.
-- `Dockerfile`: lightweight Python job; exits after the check.
-- `tests/test_main.py`: local simulation tests; no credentials or real orders needed.
-- `.env.example`: variable names only, never actual secrets.
+Manual read-only checks: `python -u main.py --check-now`. This forces a
+preview even if scheduled mode is enabled; it never submits trades.
 
-## Local verification
+## Tests
 
 ```bash
-python -m unittest discover -s tests -v # logic tests use fake SDK classes; no install needed
-python -m pip install -r requirements.txt # for a real Alpaca dry-run connection
-cp .env.example .env # Fill in your paper credentials locally
-set -a; source .env; set +a # bash/zsh only
-python main.py
+python -m unittest discover -s tests -v
+python -m compileall -q main.py
 ```
 
-The code is **paper mode + dry-run** by default. You need paper Alpaca API keys to test connection. Do not push `.env` (it is gitignored).
-
-## GitHub -> Railway deployment
-
-1. Create a **private** GitHub repository, such as `alpaca-seller-bot`, and commit these files at the repository root. If you use the GitHub CLI from this directory, run:
-
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial Alpaca sell-only risk bot"
-   gh repo create alpaca-seller-bot --private --source=. --remote=origin --push
-   ```
-
-   Otherwise create a private repo on GitHub and upload these files through the GitHub UI.
-2. In Railway, choose **New Project -> Deploy from GitHub Repo** and select the repository. The root `Dockerfile` is automatically detected.
-3. Set Railway service **Variables** (do NOT commit keys):
-
-   ```dotenv
-   APCA_API_KEY_ID=your_key
-   APCA_API_SECRET_KEY=your_secret
-   ALPACA_PAPER=true
-   DRY_RUN=true
-   ENABLE_LIVE_TRADING=false
-   ```
-
-4. In the Railway service **Settings -> Cron Schedule**, set **`*/10 * * * 1-5`**. Railway cron uses **UTC**; the bot itself uses Alpaca's market clock to skip holidays, early closings, and any time outside regular U.S. equity trading hours. The service should have **one replica** and **no public domain**. Leave **Start Command** blank to use the Dockerfile's `CMD` (or set it to `python main.py`).
-5. Deploy, and inspect **Railway logs**. A run will either say `Market closed`, log `CHECK` rows and potential `DRY RUN` exits, or report an error (nonzero exit).
-6. After confirming behavior with paper keys, set `DRY_RUN=false` to enable actual *paper* sell orders. Test with small paper positions first.
-7. **Only if you explicitly decide to trade real money:** switch to live trading keys and simultaneously set `ALPACA_PAPER=false`, `DRY_RUN=false`, `ENABLE_LIVE_TRADING=true` after reviewing the code. All eligible holdings may be automatically liquidated when thresholds trigger.
-
-Railway runs this process once per cron tick and it exits. Do **not** use both a 24/7 service loop and Railway Cron. Railway does not guarantee minute-perfect starts and skips the next invocation if a previous one is still running.
-
-## Behavior and guardrails
-
-- Alpaca market clock is checked *before* retrieving orders and positions. Only Alpaca trading days/hours are eligible; no time-zone guesswork.
-- If a symbol has any **open order**, it is skipped without canceling or modifying orders, even if it passes a threshold. Check those orders manually.
-- If 500 open orders are returned (possible truncation), the job aborts **without placing orders**, to avoid missing an open order.
-- Dry run submits **no** orders; outputs actions to logs.
-- Submission failures make the job fail, and the next Railway invocation can retry if needed. Inspect pending/open orders before manually rerunning.
-- This bot runs only on a single Alpaca account identified by the supplied keys. Never store keys in GitHub or screenshots.
-
-## Useful links
-
-- Alpaca: https://alpaca.markets/sdks/python/api_reference/trading/positions.html
-- Railway cron: https://docs.railway.com/cron-jobs
-- Railway Dockerfiles: https://docs.railway.com/builds/dockerfiles
+Do not deploy the old stop-loss implementation to the same account.
+A full position can be liquidated once it meets the threshold, so this
+may sell holdings you acquired manually, not only shares bought by V2.
+Review what assets are in the live account before activating.
