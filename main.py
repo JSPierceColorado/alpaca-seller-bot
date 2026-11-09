@@ -1,7 +1,8 @@
-"""One-shot Alpaca risk-exit job. Designed for Railway Cron, NOT a web server.
+"""Paper-only Alpaca 10% profit seller. One hourly Railway Cron check.
 
-The service exits after each check. Defaults are paper trading and dry-run.
-Only long US stock/ETF positions are eligible for closing.
+No stop loss, no buying, no shorting, no live brokerage orders. A position
+with unrealized gain >=10% may be closed in full using a market order after
+checking open orders and the actual Alpaca market clock.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 LOGGER = logging.getLogger("alpaca-seller-bot")
-STOP_LOSS_PCT = Decimal("-0.05")
 TAKE_PROFIT_PCT = Decimal("0.10")
 MAX_OPEN_ORDER_RESULTS = 500
 
@@ -36,7 +36,7 @@ def enum_value(value: Any) -> str:
 
 
 def exit_reason(unrealized_plpc: Any) -> str | None:
-    """Alpaca reports unrealized_plpc as a fraction: -0.05 == -5%."""
+    """Alpaca reports unrealized_plpc as a fraction: 0.10 == +10%."""
     if unrealized_plpc is None:
         return None
     try:
@@ -45,8 +45,6 @@ def exit_reason(unrealized_plpc: Any) -> str | None:
         return None
     if not ratio.is_finite():
         return None
-    if ratio <= STOP_LOSS_PCT:
-        return "STOP_LOSS"
     if ratio >= TAKE_PROFIT_PCT:
         return "TAKE_PROFIT"
     return None
@@ -147,12 +145,12 @@ def main() -> int:
     try:
         paper = env_flag("ALPACA_PAPER", True)
         dry_run = env_flag("DRY_RUN", True)
-        allow_live = env_flag("ENABLE_LIVE_TRADING", False)
-        if not paper and not dry_run and not allow_live:
-            raise ValueError(
-                "Real-money orders are disabled. For live mode set ALPACA_PAPER=false, "
-                "DRY_RUN=false, and ENABLE_LIVE_TRADING=true intentionally."
-            )
+        # Defense in depth: this deployment can never select a live broker.
+        # Moving to live trading would require an independently reviewed release.
+        if not paper:
+            raise ValueError("This seller is PAPER ONLY; live Alpaca trading is not supported")
+        if env_flag("ENABLE_LIVE_TRADING", False):
+            raise ValueError("ENABLE_LIVE_TRADING must stay false in paper-only seller")
         key = os.getenv("APCA_API_KEY_ID", "").strip()
         secret = os.getenv("APCA_API_SECRET_KEY", "").strip()
         if not key or not secret:
@@ -160,7 +158,7 @@ def main() -> int:
         from alpaca.trading.client import TradingClient
 
         client = TradingClient(api_key=key, secret_key=secret, paper=paper)
-        LOGGER.info("Starting one-shot risk check: paper=%s dry_run=%s", paper, dry_run)
+        LOGGER.info("Starting hourly PAPER 10 percent profit check: dry_run=%s; stop_losses=DISABLED", dry_run)
         run_check(client, dry_run=dry_run)
         return 0
     except Exception:
