@@ -94,11 +94,10 @@ def orders():
     with LOCK:
         conn=connect()
         try:
-            old=conn.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
-            previous=json.loads(old["val"]).get("orders_complete",False) if old else False
+            complete_backfill=conn.execute("SELECT val FROM meta WHERE key='orders_backfilled_v2'").fetchone()
         finally:conn.close()
-    # One-time exhaustive order backfill, followed by cheap recent incremental checks.
-    recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if previous else None
+    # Never confuse "recent page complete" with complete historical order coverage.
+    recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if complete_backfill else None
     for i in range(80 if not previous else 6):
         q={"limit":500,"status":"all","direction":"desc"}
         if recent_after:q["after"]=recent_after
@@ -113,7 +112,7 @@ def orders():
         new=batch[-1].get("submitted_at")
         if not new or new==until:break
         until=new
-    return rows,complete
+    return rows,complete,not bool(complete_backfill)
 
 def refresh():
     global LATEST_ERROR
@@ -125,7 +124,7 @@ def refresh():
         pos=get("/v2/positions")
         if not isinstance(pos,list):raise ValueError("positions schema")
         trades,at_complete=activities()
-        recent_orders,or_complete=orders()
+        recent_orders,or_complete,full_order_pass=orders()
         try:
             hist=get("/v2/account/portfolio/history",{"period":"1A","timeframe":"1D","pnl_reset":"no_reset"})
             histrows=[(priceday(t),float(dec(e))) for t,e in zip(hist.get("timestamp",[]),hist.get("equity",[])) if priceday(t) and dec(e)>0]
@@ -156,9 +155,10 @@ def refresh():
                 for x in recent_orders:
                     if x.get("id"):c.execute("INSERT OR REPLACE INTO orders VALUES(?,?,?)",(str(x["id"]),str(x.get("client_order_id") or ""),json.dumps(x)))
                 for d,px in spyrows:c.execute("INSERT OR REPLACE INTO spy VALUES(?,?)",(d,px))
-                old_state=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
-                old_quality=json.loads(old_state["val"]) if old_state else {}
-                full_order_coverage=or_complete
+                if full_order_pass and or_complete:
+                    c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("orders_backfilled_v2","true"))
+                verified_backfill=c.execute("SELECT val FROM meta WHERE key='orders_backfilled_v2'").fetchone()
+                full_order_coverage=bool(verified_backfill) and or_complete
                 c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":full_order_coverage,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
                 c.commit()
             finally:c.close()
