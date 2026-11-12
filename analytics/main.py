@@ -148,7 +148,10 @@ def refresh():
                 for x in recent_orders:
                     if x.get("id"):c.execute("INSERT OR REPLACE INTO orders VALUES(?,?,?)",(str(x["id"]),str(x.get("client_order_id") or ""),json.dumps(x)))
                 for d,px in spyrows:c.execute("INSERT OR REPLACE INTO spy VALUES(?,?)",(d,px))
-                c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":False if not or_complete else True,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
+                old_state=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
+                old_quality=json.loads(old_state["val"]) if old_state else {}
+                full_order_coverage=bool(old_quality.get("orders_complete",or_complete)) and or_complete
+                c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":full_order_coverage,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
                 c.commit()
             finally:c.close()
         LATEST_ERROR=""
