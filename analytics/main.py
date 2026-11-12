@@ -65,8 +65,19 @@ def connect():
 
 def activities():
     rows=[];token=None;complete=False
+    # Initial full backfill; later re-fetch recent days, retaining immutable older IDs.
+    with LOCK:
+        conn=connect()
+        try:
+            last=conn.execute("SELECT MAX(day) AS day FROM activities").fetchone()["day"]
+            state=conn.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
+            prior=json.loads(state["val"]).get("activities_complete",False) if state else False
+        finally:conn.close()
+    incremental=bool(prior and last)
+    after=(datetime.fromisoformat(last)-timedelta(days=3)).date().isoformat() if incremental else None
     for i in range(120):
         q={"page_size":100,"direction":"asc"}
+        if after:q["after"]=after
         if token:q["page_token"]=token
         batch=get("/v2/account/activities",q)
         if not isinstance(batch,list):raise ValueError("activities schema")
@@ -76,12 +87,13 @@ def activities():
         new=batch[-1].get("id")
         if not new or new==token:break
         token=new
-    return rows,complete
+    return rows,(complete and (prior if incremental else True))
 
 def orders():
     rows=[];until=None;complete=False;seen=set()
-    for i in range(15):
-        q={"limit":500,"status":"all","direction":"desc"}
+    for i in range(6):
+        q={"limit":500,"status":"all","direction":"desc",
+           "after":(datetime.now(timezone.utc)-timedelta(days=7)).isoformat()}
         if until:q["until"]=until
         batch=get("/v2/orders",q)
         if not isinstance(batch,list):raise ValueError("orders schema")
@@ -136,7 +148,7 @@ def refresh():
                 for x in recent_orders:
                     if x.get("id"):c.execute("INSERT OR REPLACE INTO orders VALUES(?,?,?)",(str(x["id"]),str(x.get("client_order_id") or ""),json.dumps(x)))
                 for d,px in spyrows:c.execute("INSERT OR REPLACE INTO spy VALUES(?,?)",(d,px))
-                c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":or_complete,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
+                c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":False if not or_complete else True,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
                 c.commit()
             finally:c.close()
         LATEST_ERROR=""
