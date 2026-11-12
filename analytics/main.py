@@ -95,10 +95,13 @@ def orders():
         conn=connect()
         try:
             complete_backfill=conn.execute("SELECT val FROM meta WHERE key='orders_backfilled_v2'").fetchone()
+            partial_backfill=conn.execute("SELECT val FROM meta WHERE key='orders_history_attempted_v2'").fetchone()
+            count=conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
         finally:conn.close()
-    # Never confuse "recent page complete" with complete historical order coverage.
-    recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if complete_backfill else None
-    for i in range(80 if not complete_backfill else 6):
+    # Cap expensive historical backfill. Keep the historical gap flagged.
+    already_attempted=bool(complete_backfill or partial_backfill or count>=30000)
+    recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if already_attempted else None
+    for i in range(80 if not already_attempted else 6):
         q={"limit":500,"status":"all","direction":"desc"}
         if recent_after:q["after"]=recent_after
         if until:q["until"]=until
@@ -112,7 +115,7 @@ def orders():
         new=batch[-1].get("submitted_at")
         if not new or new==until:break
         until=new
-    return rows,complete,not bool(complete_backfill)
+    return rows,complete,not already_attempted
 
 def refresh():
     global LATEST_ERROR
@@ -155,8 +158,14 @@ def refresh():
                 for x in recent_orders:
                     if x.get("id"):c.execute("INSERT OR REPLACE INTO orders VALUES(?,?,?)",(str(x["id"]),str(x.get("client_order_id") or ""),json.dumps(x)))
                 for d,px in spyrows:c.execute("INSERT OR REPLACE INTO spy VALUES(?,?)",(d,px))
-                if full_order_pass and or_complete:
-                    c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("orders_backfilled_v2","true"))
+                if full_order_pass:
+                    c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("orders_history_attempted_v2","true"))
+                    if or_complete:
+                        c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("orders_backfilled_v2","true"))
+                else:
+                    existing_count=c.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
+                    if existing_count>=30000:
+                        c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("orders_history_attempted_v2","true"))
                 verified_backfill=c.execute("SELECT val FROM meta WHERE key='orders_backfilled_v2'").fetchone()
                 full_order_coverage=bool(verified_backfill) and or_complete
                 c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":full_order_coverage,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
