@@ -98,7 +98,7 @@ def orders():
         finally:conn.close()
     # Never confuse "recent page complete" with complete historical order coverage.
     recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if complete_backfill else None
-    for i in range(80 if not previous else 6):
+    for i in range(80 if not complete_backfill else 6):
         q={"limit":500,"status":"all","direction":"desc"}
         if recent_after:q["after"]=recent_after
         if until:q["until"]=until
@@ -167,7 +167,7 @@ def refresh():
         LOG.info("ANALYTICS_SUMMARY %s",json.dumps({"date":day,"equity":rep["account"]["equity"],"unrealized":rep["account"]["unrealized"],"covered_realized":rep["trades"]["realized"],"win_rate":rep["trades"]["win_rate"],"closed_orders":rep["trades"]["closed_orders"],"benchmark":rep["benchmark"]["last"] if rep["benchmark"] else None,"quality":rep["quality"]},separators=(",",":")))
     except Exception as e:
         LATEST_ERROR=type(e).__name__
-        LOG.error("ANALYTICS_REFRESH_FAILED type=%s",type(e).__name__)
+        LOG.exception("ANALYTICS_REFRESH_FAILED type=%s",type(e).__name__)
     finally:RUN.release()
 
 def fifo(acts,ids):
