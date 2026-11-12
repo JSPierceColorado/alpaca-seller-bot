@@ -104,8 +104,8 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(r["preview"],1)
         self.assertEqual(client.submitted,[])
 
-    def test_no_sale_on_unverified_membership_and_no_short_or_crypto(self):
-        client=FakeClient([pos(sym="BAD",price="40",pnl="-.6"),
+    def test_no_sale_of_sp100_loser_and_no_short_or_crypto(self):
+        client=FakeClient([pos(sym="KO",price="40",pnl="-.6"),
                            pos(sym="SHORT",price="140",pnl=".4"),
                            pos(sym="BTC",price="140",pnl=".4")])
         client.positions[1].side="short"
