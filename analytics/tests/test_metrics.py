@@ -29,9 +29,11 @@ class AnalyticsTests(unittest.TestCase):
     def test_order_backfill_and_incremental_pagination(self):
         from unittest.mock import patch
         class DB:
-            def __init__(self,has_marker):self.has_marker=has_marker
-            def execute(self,*args):return self
-            def fetchone(self):return {"val":"true"} if self.has_marker else None
+            def __init__(self,has_marker):self.has_marker=has_marker;self.query=""
+            def execute(self,query,*args):self.query=query;return self
+            def fetchone(self):
+                if "COUNT" in self.query:return {"n":0}
+                return {"val":"true"} if self.has_marker else None
             def close(self):pass
         for marker in (False,True):
             seen=[]
