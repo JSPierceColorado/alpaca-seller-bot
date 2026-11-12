@@ -26,6 +26,25 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(r["unmatched_sells"],1)
         self.assertIsNone(r["win_rate"])
 
+    def test_order_backfill_and_incremental_pagination(self):
+        from unittest.mock import patch
+        class DB:
+            def __init__(self,has_marker):self.has_marker=has_marker
+            def execute(self,*args):return self
+            def fetchone(self):return {"val":"true"} if self.has_marker else None
+            def close(self):pass
+        for marker in (False,True):
+            seen=[]
+            def fake_get(path,params):
+                seen.append(params)
+                return []
+            with patch.object(main,"connect",return_value=DB(marker)),patch.object(main,"get",side_effect=fake_get):
+                rows,complete,full=main.orders()
+            self.assertEqual(rows,[])
+            self.assertTrue(complete)
+            self.assertEqual(full,not marker)
+            self.assertEqual("after" in seen[0],marker)
+
     def test_trade_api_is_read_only(self):
         import inspect
         code=inspect.getsource(main.get)
