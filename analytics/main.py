@@ -173,6 +173,15 @@ def refresh():
             finally:c.close()
         LATEST_ERROR=""
         rep=report()
+        LOG.info("ANALYTICS_TOOL_REPORT %s",json.dumps({
+            "as_of":rep["as_of"],"account":rep["account"],
+            "trades":rep["trades"],"quality":rep["quality"],
+            "history":rep["account_history"][-100:],
+            "benchmark_series":rep["series"][-100:],
+            "positions":[{"symbol":x["symbol"],"value":round(x["value"],2),
+                          "unrealized":round(x["unrealized"],2)}
+                         for x in rep["positions"]]
+        },separators=(",",":")))
         LOG.info("ANALYTICS_SUMMARY %s",json.dumps({"date":day,"equity":rep["account"]["equity"],"unrealized":rep["account"]["unrealized"],"covered_realized":rep["trades"]["realized"],"win_rate":rep["trades"]["win_rate"],"closed_orders":rep["trades"]["closed_orders"],"benchmark":rep["benchmark"]["last"] if rep["benchmark"] else None,"quality":rep["quality"]},separators=(",",":")))
     except Exception as e:
         LATEST_ERROR=type(e).__name__
