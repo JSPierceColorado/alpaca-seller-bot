@@ -114,7 +114,7 @@ def validated_sp100_snapshot(rows,now):
         if not SYMBOL.fullmatch(symbol) or symbol in members:
             raise RuntimeError("SP100_LIST_INVALID_OR_DUPLICATE")
         members.add(symbol)
-    if not 95<=len(members)<=110:
+    if len(members)!=101:
         raise RuntimeError("SP100_LIST_INCOMPLETE")
     return members,scanned
 
