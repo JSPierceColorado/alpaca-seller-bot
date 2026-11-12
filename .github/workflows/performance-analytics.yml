@@ -1,0 +1,17 @@
+name: Performance Analytics checks
+on:
+  push:
+    branches: [performance-analytics]
+    paths: ['analytics/**', '.github/workflows/performance-analytics.yml']
+  workflow_dispatch:
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r analytics/requirements.txt
+      - run: python -m compileall -q analytics
+      - run: python -m unittest discover -s analytics/tests -v
