@@ -66,7 +66,13 @@ def sdk_stub():
 
 
 class SellerTests(unittest.TestCase):
-    def test_exact_profit_threshold_without_stop_losses(self):
+    def setUp(self):
+        self.membership_patcher=patch.object(
+            main,"load_sp100_membership",return_value={"KO","JNJ","PG","BRK.B"})
+        self.membership_patcher.start()
+        self.addCleanup(self.membership_patcher.stop)
+
+    def test_exact_profit_threshold(self):
         self.assertFalse(main.position_profit_trigger(pos(price="80",pnl="-0.20")))
         self.assertFalse(main.position_profit_trigger(pos(price="109.99",pnl="0.0999")))
         self.assertTrue(main.position_profit_trigger(pos(price="110",pnl="0.10")))
@@ -98,7 +104,7 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(r["preview"],1)
         self.assertEqual(client.submitted,[])
 
-    def test_no_sale_at_any_loss_and_no_short_or_crypto(self):
+    def test_no_sale_on_unverified_membership_and_no_short_or_crypto(self):
         client=FakeClient([pos(sym="BAD",price="40",pnl="-.6"),
                            pos(sym="SHORT",price="140",pnl=".4"),
                            pos(sym="BTC",price="140",pnl=".4")])
@@ -107,6 +113,66 @@ class SellerTests(unittest.TestCase):
         with patch.dict(sys.modules,sdk_stub()):
             a=main.check_once(client,dry_run=False,now=NOW)
         self.assertEqual(a["submitted"],0)
+
+
+    def test_stop_loss_threshold_uses_both_broker_ratio_and_cost(self):
+        self.assertTrue(main.position_stop_loss_trigger(pos(sym="ABCD",price="95",pnl="-0.05")))
+        self.assertTrue(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="-0.06")))
+        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="95.1",pnl="-0.049")))
+        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="-0.04")))
+        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="96",pnl="-0.06")))
+        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="NaN")))
+
+    def test_sp100_losing_stock_never_stopped(self):
+        client=FakeClient([pos(sym="KO",price="60",pnl="-.4")])
+        with patch.dict(sys.modules,sdk_stub()):
+            report=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(report["eligible"],0)
+        self.assertEqual(client.submitted,[])
+
+    def test_non_sp100_loss_triggers_full_sell_once(self):
+        client=FakeClient([pos(sym="QLYS",price="95",pnl="-.05",qty="0.512345678")])
+        with patch.dict(sys.modules,sdk_stub()):
+            first=main.check_once(client,dry_run=False,now=NOW)
+            second=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(first["submitted"],1)
+        self.assertEqual(second["submitted"],0)
+        self.assertEqual(len(client.submitted),1)
+        self.assertEqual(client.submitted[0]["qty"],0.512345678)
+        self.assertEqual(client.submitted[0]["client_order_id"],"v2s-20261109-QLYS")
+
+    def test_non_sp100_does_not_stop_before_five_percent(self):
+        client=FakeClient([pos(sym="QLYS",price="95.5",pnl="-.045")])
+        with patch.dict(sys.modules,sdk_stub()):
+            report=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(report["submitted"],0)
+
+    def test_unavailable_membership_disables_only_loss_exits(self):
+        client=FakeClient([pos(sym="QLYS",price="80",pnl="-.20"),
+                           pos(sym="KO",price="110",pnl=".10")])
+        with patch.object(main,"load_sp100_membership",side_effect=RuntimeError("offline")):
+            with patch.dict(sys.modules,sdk_stub()):
+                report=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(report["submitted"],1)
+        self.assertEqual(client.submitted[0]["symbol"],"KO")
+
+    def test_membership_snapshot_validates_freshness_and_completeness(self):
+        head=["symbol","close","sma_200","sma_50","pos_52w",
+              "dollar_vol_m","score","","last_scan_utc","completed_session_date"]
+        rows=[head]+[[f"S{i:03d}"] for i in range(101)]
+        rows[1]=["S000",1,1,1,0.5,2,80,"","2026-11-09T16:00:00+00:00","2026-11-06"]
+        members,stamp=main.validated_sp100_snapshot(rows,NOW)
+        self.assertEqual(len(members),101)
+        self.assertIn("S000",members)
+        with self.assertRaisesRegex(RuntimeError,"INCOMPLETE"):
+            main.validated_sp100_snapshot(rows[:35],NOW)
+        with self.assertRaisesRegex(RuntimeError,"STALE"):
+            main.validated_sp100_snapshot(
+                rows,datetime(2026,11,16,19,35,tzinfo=timezone.utc))
+        copy=[r.copy() for r in rows]
+        copy[2][0]="S000"
+        with self.assertRaisesRegex(RuntimeError,"DUPLICATE"):
+            main.validated_sp100_snapshot(copy,NOW)
 
     def test_closed_market_returns_without_snapshot(self):
         client=FakeClient(open_=False)
