@@ -29,6 +29,16 @@ def dateval(v):
         return t.astimezone(NY).date().isoformat()
     except Exception:return None
 
+def priceday(value):
+    """Daily bar timestamps represent their source trading date in UTC."""
+    try:
+        if isinstance(value,(int,float)):
+            return datetime.fromtimestamp(value,timezone.utc).date().isoformat()
+        candidate=str(value or "")[:10]
+        datetime.fromisoformat(candidate)
+        return candidate
+    except Exception:return None
+
 def get(path,params=None,market=False):
     paper=os.getenv("ALPACA_PAPER","false").lower() in ("true","1")
     host="https://data.alpaca.markets" if market else ("https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets")
@@ -98,7 +108,7 @@ def refresh():
         recent_orders,or_complete=orders()
         try:
             hist=get("/v2/account/portfolio/history",{"period":"1A","timeframe":"1D","pnl_reset":"no_reset"})
-            histrows=[(dateval(t),float(dec(e))) for t,e in zip(hist.get("timestamp",[]),hist.get("equity",[])) if dateval(t) and dec(e)>0]
+            histrows=[(priceday(t),float(dec(e))) for t,e in zip(hist.get("timestamp",[]),hist.get("equity",[])) if priceday(t) and dec(e)>0]
         except Exception as e:
             LOG.warning("HISTORY_UNAVAILABLE type=%s",type(e).__name__)
             histrows=[]
@@ -106,7 +116,7 @@ def refresh():
         end=(now+timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z")
         try:
             bars=get("/v2/stocks/SPY/bars",{"timeframe":"1Day","start":start,"end":end,"feed":"iex","adjustment":"all","limit":10000},market=True)
-            spyrows=[(dateval(x.get("t")),float(dec(x.get("c")))) for x in bars.get("bars",[]) if dateval(x.get("t")) and dec(x.get("c"))>0]
+            spyrows=[(priceday(x.get("t")),float(dec(x.get("c")))) for x in bars.get("bars",[]) if priceday(x.get("t")) and dec(x.get("c"))>0]
         except Exception as e:
             LOG.warning("SPY_UNAVAILABLE type=%s",type(e).__name__)
             spyrows=[]
@@ -118,6 +128,7 @@ def refresh():
                 c.execute("INSERT OR REPLACE INTO equity VALUES(?,?,?)",(day,float(dec(acct["equity"])),"live"))
                 unreal=sum((dec(x.get("unrealized_pl")) for x in pos),Decimal(0))
                 c.execute("INSERT OR REPLACE INTO account VALUES(?,?,?,?,?)",(day,now.isoformat(),float(dec(acct["equity"])),float(dec(acct.get("cash"))),float(unreal)))
+                c.execute("INSERT OR IGNORE INTO meta VALUES(?,?)",("benchmark_start",day))
                 c.execute("DELETE FROM positions WHERE day=?",(day,))
                 for x in pos:c.execute("INSERT OR REPLACE INTO positions VALUES(?,?,?)",(day,str(x.get("symbol")),json.dumps(x)))
                 for x in trades:
@@ -183,16 +194,24 @@ def report():
             spy={x["day"]:x["price"] for x in c.execute("SELECT day,price FROM spy")}
             q=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
             quality=json.loads(q["val"]) if q else {}
+            baseline_row=c.execute("SELECT val FROM meta WHERE key='benchmark_start'").fetchone()
+            startday=baseline_row["val"] if baseline_row else acct["day"]
         finally:c.close()
-    flows=defaultdict(float);transfers=0
+    flows=defaultdict(float);transfers=0;new_transfers=0
     for a in acts:
         kind=a.get("activity_type")
         if kind in ("CSD","CSW"):
             day=dateval(a.get("transaction_time") or a.get("date"))
             if day:flows[day]+=(1 if kind=="CSD" else -1)*abs(float(dec(a.get("net_amount"))))
-        if kind in ("ACATS","ACATC","JNLS","JNLC","REORG","SSP","SSO","MA","SC"):transfers+=1
+        if kind in ("ACATS","ACATC","JNLS","JNLC","REORG","SSP","SSO","MA","SC"):
+            transfers+=1
+            at_day=dateval(a.get("transaction_time") or a.get("date"))
+            if at_day and at_day>=startday:new_transfers+=1
     covered=fifo(acts,ids)
-    series=[];eq=[(d,e) for d,e in equities if d in spy and e>0 and spy[d]>0]
+    series=[];eq=[(d,e) for d,e in equities if d>=startday and d in spy and e>0 and spy[d]>0]
+    history=[{"date":d,"equity":round(e,2)} for d,e in equities if e>0]
+    if new_transfers or not quality.get("activities_complete"):
+        eq=[] # Forward benchmark not trustworthy until all post-baseline flows reconcile.
     dd=0
     if len(eq)>=2:
         baseline,initial=eq[0];shares=initial/spy[baseline];net=0;unit=100;top=100;prev=initial
@@ -213,12 +232,14 @@ def report():
     if not quality.get("activities_complete"):warnings.append("Activity history is incomplete; exclude unverified results from decisions.")
     if not quality.get("orders_complete"):warnings.append("Order history incomplete; bot attribution may be missing.")
     if covered["unmatched_sells"]:warnings.append("Sells without observed matching buy lots excluded from realized results and win rate.")
-    if transfers:warnings.append("Transfers/corporate actions detected: benchmark and FIFO basis require reconciliation.")
-    if not series:warnings.append("SPY benchmark unavailable until matching price and equity dates are present.")
+    if transfers:warnings.append("Historical transfers/corporate actions detected: pre-baseline comparison would be unreliable.")
+    if new_transfers:warnings.append("Post-baseline transfers/corporate actions detected: SPY comparison suspended pending reconciliation.")
+    warnings.append("Forward SPY tracking starts on "+startday+"; historical equity remains visible but is not a validated strategy backtest.")
+    if not series:warnings.append("Forward SPY comparison requires two matched post-baseline market dates and reconciled cash flows.")
     return {"status":"ok","as_of":acct["updated"],"account":{"day":acct["day"],"equity":round(acct["equity"],2),"cash":round(acct["cash"],2),"unrealized":round(acct["unrealized"],2),"positions":len(positions)},
       "positions":[{"symbol":x.get("symbol"),"qty":x.get("qty"),"value":float(dec(x.get("market_value"))),"unrealized":float(dec(x.get("unrealized_pl")))} for x in positions],
       "trades":covered,"benchmark":{"baseline":series[0]["date"],"last":series[-1],"max_drawdown_pct_est":round(dd,2)} if series else None,
-      "series":series,"quality":{"checks":quality,"warnings":warnings},"last_error":LATEST_ERROR}
+      "series":series,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday},"last_error":LATEST_ERROR}
 
 def graph(points,keys):
     if len(points)<2:return '<p class="muted">Not enough comparable observations.</p>'
@@ -243,12 +264,14 @@ def graph(points,keys):
 
 def dashboard(rep,rangeval):
     if rep.get("status")!="ok":return "<h1>Performance Analytics</h1><p>Awaiting first broker sync.</p>"
-    p=rep["series"]
+    p=rep["series"];history=rep["account_history"]
     if rangeval in ("1m","3m","6m","1y"):
         days={"1m":31,"3m":92,"6m":184,"1y":366}[rangeval]
         cutoff=(datetime.now(NY).date()-timedelta(days=days)).isoformat()
         sub=[x for x in p if x["date"]>=cutoff]
         if len(sub)>1:p=sub
+        recent=[x for x in history if x["date"]>=cutoff]
+        if len(recent)>1:history=recent
     a=rep["account"];t=rep["trades"];b=rep["benchmark"]
     currency=lambda v:"—" if v is None else "$"+format(float(v),",.2f")
     percent=lambda v:"—" if v is None else format(float(v),".2f")+"%"
@@ -266,6 +289,7 @@ def dashboard(rep,rangeval):
     return ('<header><p class="accent">READ ONLY · ALPACA ACCOUNT</p><h1>Investment Performance Control Center</h1><p class="muted">Broker snapshot '+html.escape(rep["as_of"])+'</p></header>'
       +'<section class="grid">'+boxes+'</section>'
       +'<nav>'+nav+' <a href="/api/report">Full JSON</a> <a href="/api/summary">Summary API</a> <a href="/export/snapshots.csv">CSV</a> <a href="/refresh">Refresh now</a></nav>'
+      +'<section class="panel"><h2>Broker-reported total equity history</h2><p class="muted">Account equity includes deposits and withdrawals; this is not a return chart.</p>'+graph(history,[("equity","Alpaca equity")])+'</section>'
       +'<section class="panel"><h2>Cash-flow-adjusted return index (start = 100)</h2><p class="muted">Approximate daily time-weighted Alpaca performance vs SPY dividend-adjusted return.</p>'+graph(p,[("account_index","Alpaca"),("spy_index","SPY")])+'</section>'
       +'<section class="panel"><h2>Actual equity vs hypothetical SPY equity</h2><p class="muted">Same starting balance and recorded deposits/withdrawals. Baseline '+html.escape(b["baseline"] if b else "pending")+'.</p>'+graph(p,[("equity","Alpaca"),("spy_equity","SPY")])+'</section>'
       +'<section class="panel"><h2>Net P&L after external cash flows</h2>'+graph(p,[("account_net","Alpaca"),("spy_net","SPY")])+'</section>'
@@ -308,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
         rep=report()
         if target.path in ("/api/report","/api/summary"):
             if target.path=="/api/summary":
-                rep={k:v for k,v in rep.items() if k not in ("series","positions")}
+                rep={k:v for k,v in rep.items() if k not in ("series","positions","account_history")}
             self.send(json.dumps(rep),"application/json");return
         if target.path=="/export/snapshots.csv":
             sio=io.StringIO();w=csv.writer(sio)
