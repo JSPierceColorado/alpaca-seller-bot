@@ -35,6 +35,6 @@ class AnalyticsTests(unittest.TestCase):
     def test_date_and_amount(self):
         self.assertEqual(main.dateval("2026-11-11T16:00:00Z"),"2026-11-11")
         self.assertEqual(main.dec("NaN"),0)
-        self.assertEqual(main.dec("12.35"),12.35)
+        self.assertEqual(str(main.dec("12.35")),"12.35")
 
 if __name__=="__main__":unittest.main()
