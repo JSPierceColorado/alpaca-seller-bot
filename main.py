@@ -1,17 +1,21 @@
-"""V2 SELLER: live-account 10%-profit exits, hourly in regular NYSE hours.
+"""V2 SELLER: hourly +10% exits and -5% stops only for non-S&P 100 stocks.
 
-Always-on Railway worker (not Railway Cron). 09:35–15:35 Eastern, weekdays;
-Alpaca market clock is the authoritative open/closed check. Long US equities
-only. No buy logic, stop losses, shorts, trailing orders, options or crypto.
-Each sell uses an idempotent per-day client order ID and full held qty.
+Always-on Railway worker, 09:35–15:35 Eastern on trading weekdays.
+S&P 100 membership is verified against the V2 Screener constituent sheet.
+If membership verification fails, stop-loss exits are disabled; +10% exits
+remain active. This is an hourly price trigger, NOT a broker-native stop order.
+Only long US equities, one full-position market exit per symbol/day.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
@@ -19,8 +23,10 @@ from zoneinfo import ZoneInfo
 LOG=logging.getLogger("v2-seller")
 NEW_YORK=ZoneInfo("America/New_York")
 TAKE_PROFIT=Decimal("0.10")
+STOP_LOSS=Decimal("-0.05")
+SP100_SHEET_ID="14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ"
 Q9=Decimal("0.000000001")
-SYMBOL=re.compile(r"^[A-Z][A-Z0-9.\\-]{0,10}$")
+SYMBOL=re.compile(r"^[A-Z][A-Z0-9.\-]{0,10}$")
 MAX_OPEN=500
 
 
@@ -53,6 +59,95 @@ def position_profit_trigger(position)->bool:
         computed=price/cost-1
         return ratio>=TAKE_PROFIT and computed>=TAKE_PROFIT
     except ValueError:return False
+
+
+def position_stop_loss_trigger(position)->bool:
+    """Only a verified loss of >=5% relative to average entry can trigger."""
+    try:
+        ratio=dec(getattr(position,"unrealized_plpc",None))
+        cost=dec(getattr(position,"avg_entry_price",None))
+        price=dec(getattr(position,"current_price",None))
+        qty=dec(getattr(position,"qty",None))
+        if qty<=0 or cost<=0 or price<=0:return False
+        computed=price/cost-1
+        return ratio<=STOP_LOSS and computed<=STOP_LOSS
+    except ValueError:return False
+
+
+def exit_trigger(position,symbol,members):
+    """Gain exit for all equities; loss exit only when known not to be in S&P 100."""
+    if position_profit_trigger(position):
+        return "GAIN_GE_10_PCT"
+    if members is not None and symbol not in members and position_stop_loss_trigger(position):
+        return "LOSS_LE_5_PCT_NON_SP100"
+    return None
+
+
+def validated_sp100_snapshot(rows,now):
+    """Fail closed for missing, incomplete, future-dated or stale membership."""
+    header=["symbol","close","sma_200","sma_50","pos_52w","dollar_vol_m","score"]
+    if not rows or len(rows[0])<10 or rows[0][:7]!=header or \
+       rows[0][8:10]!=["last_scan_utc","completed_session_date"]:
+        raise RuntimeError("SP100_SCREENER_SCHEMA_MISMATCH")
+    if len(rows)<2 or len(rows[1])<10:
+        raise RuntimeError("SP100_SCAN_STAMP_MISSING")
+    try:
+        scanned=datetime.fromisoformat(str(rows[1][8]).replace("Z","+00:00"))
+        completed=datetime.fromisoformat(str(rows[1][9])).date()
+    except ValueError:
+        raise RuntimeError("SP100_SCAN_STAMP_INVALID") from None
+    if scanned.tzinfo is None:
+        raise RuntimeError("SP100_SCAN_STAMP_NAIVE")
+    if now.tzinfo is None:
+        raise RuntimeError("SP100_CURRENT_TIME_NAIVE")
+    age=(now.astimezone(timezone.utc)-scanned.astimezone(timezone.utc)).total_seconds()
+    if age < -600 or age > 96*3600:
+        raise RuntimeError("SP100_SCAN_STALE_OR_FUTURE")
+    session_age=(scanned.astimezone(NEW_YORK).date()-completed).days
+    if not 0<session_age<=7:
+        raise RuntimeError("SP100_COMPLETED_SESSION_INVALID")
+    members=set()
+    for row in rows[1:]:
+        symbol=str(row[0] or "").strip().upper() if row else ""
+        if not symbol:
+            continue
+        if not SYMBOL.fullmatch(symbol) or symbol in members:
+            raise RuntimeError("SP100_LIST_INVALID_OR_DUPLICATE")
+        members.add(symbol)
+    if not 95<=len(members)<=110:
+        raise RuntimeError("SP100_LIST_INCOMPLETE")
+    return members,scanned
+
+
+def load_sp100_membership(now=None):
+    """Read S&P 100 membership from V2's existing verified Screener snapshot."""
+    from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
+    raw=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
+    if not raw:
+        raise RuntimeError("SP100_GOOGLE_CREDENTIALS_MISSING")
+    try:
+        service_info=json.loads(raw)
+        creds=service_account.Credentials.from_service_account_info(
+            service_info,scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    except (ValueError,KeyError,TypeError):
+        raise RuntimeError("SP100_GOOGLE_CREDENTIALS_INVALID") from None
+    creds.refresh(Request())
+    sheet_id=os.getenv("GOOGLE_SHEET_ID",SP100_SHEET_ID).strip()
+    if not sheet_id:
+        raise RuntimeError("SP100_SHEET_ID_MISSING")
+    url=("https://sheets.googleapis.com/v4/spreadsheets/"
+         +urllib.parse.quote(sheet_id,safe="")
+         +"/values/"
+         +urllib.parse.quote("'Screener'!A1:J150",safe="")
+         +"?valueRenderOption=UNFORMATTED_VALUE")
+    request=urllib.request.Request(url,headers={"Authorization":"Bearer "+creds.token})
+    with urllib.request.urlopen(request,timeout=20) as response:
+        rows=json.load(response).get("values",[])
+    checked_at=now or datetime.now(timezone.utc)
+    members,scanned=validated_sp100_snapshot(rows,checked_at)
+    LOG.info("SP100_MEMBERSHIP_VERIFIED members=%d last_scan=%s",len(members),scanned.isoformat())
+    return members
 
 
 def unique_id(day,symbol):
@@ -104,6 +199,14 @@ def check_once(client,*,dry_run,now=None):
     blocked=market_snapshot(client)
     positions=client.get_all_positions()
     if positions is None:raise RuntimeError("BROKER_POSITIONS_UNVERIFIABLE")
+    try:
+        members=load_sp100_membership(now)
+    except Exception as exc:
+        # Do not guess index membership or treat "unknown" as non-S&P100.
+        # The existing +10% profit exits remain available.
+        members=None
+        LOG.error("SP100_MEMBERSHIP_UNAVAILABLE error_type=%s; STOP_LOSS_DISABLED",
+                  type(exc).__name__)
     date=now.astimezone(NEW_YORK).date().isoformat()
     eligible=0
     submitted=0
@@ -114,7 +217,8 @@ def check_once(client,*,dry_run,now=None):
         cls=str(getattr(getattr(p,"asset_class",None),"value",getattr(p,"asset_class",None))).lower()
         side=str(getattr(getattr(p,"side",None),"value",getattr(p,"side",None))).lower()
         if cls!="us_equity" or side!="long":continue
-        if not position_profit_trigger(p):continue
+        trigger=exit_trigger(p,sym,members)
+        if trigger is None:continue
         eligible+=1
         if sym in blocked:
             LOG.info("SELL_SKIP_OPEN_ORDER symbol=%s",sym)
@@ -130,8 +234,8 @@ def check_once(client,*,dry_run,now=None):
             break
         current=client.get_open_position(sym)
         if (str(getattr(getattr(current,"side",None),"value",getattr(current,"side",None))).lower()!="long"
-            or not position_profit_trigger(current)):
-            LOG.info("SELL_SKIP_GAIN_MOVED symbol=%s",sym)
+            or exit_trigger(current,sym,members)!=trigger):
+            LOG.info("SELL_SKIP_TRIGGER_MOVED symbol=%s trigger=%s",sym,trigger)
             continue
         if sym in market_snapshot(client):
             LOG.info("SELL_SKIP_OPEN_ORDER_RECHECK symbol=%s",sym)
@@ -142,8 +246,8 @@ def check_once(client,*,dry_run,now=None):
             continue
         if dry_run:
             previews+=1
-            LOG.info("SELL_PREVIEW symbol=%s qty=%s broker_gain=%s",
-                     sym,qty,current.unrealized_plpc)
+            LOG.info("SELL_PREVIEW symbol=%s qty=%s broker_gain=%s trigger=%s",
+                     sym,qty,current.unrealized_plpc,trigger)
             continue
         # Limit to exactly one broker POST; on an ambiguous network error
         # do not retry this run, and reconcile by client ID next cycle.
@@ -157,8 +261,8 @@ def check_once(client,*,dry_run,now=None):
             raise RuntimeError("SELL_ORDER_STATUS_UNCERTAIN_NO_RETRY") from None
         blocked.add(sym)
         submitted+=1
-        LOG.warning("LIVE_SELL_SENT symbol=%s cid=%s order_id=%s trigger=GAIN_GE_10_PCT",
-                    sym,cid,getattr(response,"id","ACK_PENDING"))
+        LOG.warning("LIVE_SELL_SENT symbol=%s cid=%s order_id=%s trigger=%s",
+                    sym,cid,getattr(response,"id","ACK_PENDING"),trigger)
     LOG.info("SELL_CYCLE_COMPLETE eligible=%d submitted=%d preview=%d",
              eligible,submitted,previews)
     return {"status":"OK","eligible":eligible,"submitted":submitted,"preview":previews}
@@ -196,15 +300,25 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-now",action="store_true",
         help="One read-only preview only; respects Alpaca market-open clock")
+    parser.add_argument("--check-membership",action="store_true",
+        help="Read-only independent S&P 100 sheet verification; no broker orders")
     args=parser.parse_args()
     logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
         format="%(asctime)s %(levelname)s %(message)s",stream=sys.stdout)
+    if args.check_membership:
+        LOG.info("SP100_READ_ONLY_CHECK_OK members=%d",len(load_sp100_membership()))
+        return
     if args.check_now:
         client,_,_=clients()
         check_once(client,dry_run=True)
         return
     # Validate mode and keys immediately, before claiming service is ready.
     _,dry,paper=clients()
+    try:
+        LOG.info("SP100_STARTUP_PREFLIGHT_OK members=%d",len(load_sp100_membership()))
+    except Exception as exc:
+        LOG.error("SP100_STARTUP_PREFLIGHT_FAILED error_type=%s; STOP_LOSS_DISABLED_UNTIL_VERIFIED",
+                  type(exc).__name__)
     from apscheduler.schedulers.blocking import BlockingScheduler
     scheduler=BlockingScheduler(timezone=NEW_YORK,
         job_defaults={"coalesce":True,"max_instances":1,"misfire_grace_time":900})
@@ -212,7 +326,7 @@ def main():
         hour="9-15",minute=35,id="v2_seller_hourly",
         replace_existing=True)
     LOG.info("V2_SELLER_STARTED schedule=09:35..15:35 America/New_York"
-             " every_hour=TRUE no_stop_loss=TRUE mode=%s dry_run=%s",
+             " every_hour=TRUE take_profit=10pct non_sp100_stop_loss=-5pct mode=%s dry_run=%s",
              "PAPER" if paper else "LIVE",dry)
     scheduler.start()
 
