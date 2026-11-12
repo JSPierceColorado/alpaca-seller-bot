@@ -91,9 +91,17 @@ def activities():
 
 def orders():
     rows=[];until=None;complete=False;seen=set()
-    for i in range(6):
-        q={"limit":500,"status":"all","direction":"desc",
-           "after":(datetime.now(timezone.utc)-timedelta(days=7)).isoformat()}
+    with LOCK:
+        conn=connect()
+        try:
+            old=conn.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
+            previous=json.loads(old["val"]).get("orders_complete",False) if old else False
+        finally:conn.close()
+    # One-time exhaustive order backfill, followed by cheap recent incremental checks.
+    recent_after=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat() if previous else None
+    for i in range(80 if not previous else 6):
+        q={"limit":500,"status":"all","direction":"desc"}
+        if recent_after:q["after"]=recent_after
         if until:q["until"]=until
         batch=get("/v2/orders",q)
         if not isinstance(batch,list):raise ValueError("orders schema")
@@ -150,7 +158,7 @@ def refresh():
                 for d,px in spyrows:c.execute("INSERT OR REPLACE INTO spy VALUES(?,?)",(d,px))
                 old_state=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
                 old_quality=json.loads(old_state["val"]) if old_state else {}
-                full_order_coverage=bool(old_quality.get("orders_complete",or_complete)) and or_complete
+                full_order_coverage=or_complete
                 c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",("quality",json.dumps({"activities_complete":at_complete,"orders_complete":full_order_coverage,"activities_received":len(trades),"orders_received":len(recent_orders),"spy_price_source":"Alpaca IEX dividend/split adjusted","history_days":len(histrows),"spy_days":len(spyrows)})))
                 c.commit()
             finally:c.close()
