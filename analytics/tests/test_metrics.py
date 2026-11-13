@@ -47,6 +47,115 @@ class AnalyticsTests(unittest.TestCase):
             self.assertEqual(full,not marker)
             self.assertEqual("after" in seen[0],marker)
 
+    def eod(self,day,equity,cash):
+        return {"day":day,"updated":day+"T23:30:00+00:00",
+                "equity":equity,"cash":cash}
+
+    def benchmark(self,rows,activities=None,prices=None,complete=True):
+        return main.verified_spy_benchmark(
+            rows,prices or {"2026-11-12":100,"2026-11-13":100},
+            activities or [],"2026-11-12",complete)
+
+    def test_baseline_uses_after_close_funding_not_intraday_equity(self):
+        rows=[
+            {"day":"2026-11-12","updated":"2026-11-12T14:40:00+00:00",
+             "equity":3416.89,"cash":2704.86},
+            self.eod("2026-11-12",4411.22,3704.86),
+            self.eod("2026-11-13",4413.47,3704.86)]
+        closes=main.completed_daily_snapshots(rows)
+        self.assertEqual(closes[0]["equity"],main.Decimal("4411.22"))
+        series,dd,issues=self.benchmark(rows)
+        self.assertEqual(issues,[])
+        self.assertEqual(series[0]["account_index"],100)
+        self.assertAlmostEqual(series[1]["account_index"],100.051,places=2)
+        self.assertAlmostEqual(series[1]["account_net"],2.25,places=2)
+        self.assertLess(series[1]["account_index"],101)
+
+    def test_deposit_is_never_return_and_spy_receives_same_funding(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-13",2000,2000)]
+        deposit=[{"activity_type":"CSD","id":"deposit-1","date":"2026-11-13",
+                  "net_amount":"1000"}]
+        series,dd,issues=self.benchmark(rows,deposit)
+        self.assertEqual(issues,[])
+        self.assertEqual(series[-1]["cashflow"],1000)
+        self.assertEqual(series[-1]["cumulative_external_cashflow"],1000)
+        self.assertEqual(series[-1]["account_index"],100)
+        self.assertEqual(series[-1]["account_net"],0)
+        self.assertEqual(series[-1]["spy_equity"],2000)
+        self.assertEqual(series[-1]["spy_net"],0)
+
+    def test_unrecorded_funding_suspends_instead_of_fabricating_return(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-13",2000,2000)]
+        series,dd,issues=self.benchmark(rows)
+        self.assertEqual(series,[])
+        self.assertIn("CASH_LEDGER_MISMATCH_2026-11-13",issues)
+
+    def test_withdrawal_excluded_from_loss_and_spy_sells_shares(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-13",600,600)]
+        withdrawal=[{"activity_type":"CSW","id":"wd","date":"2026-11-13",
+                     "net_amount":"-400"}]
+        series,dd,issues=self.benchmark(rows,withdrawal)
+        self.assertEqual(issues,[])
+        self.assertEqual(series[-1]["account_net"],0)
+        self.assertEqual(series[-1]["spy_net"],0)
+        self.assertEqual(series[-1]["account_index"],100)
+
+    def test_ordinary_trade_cash_movement_is_not_deposit(self):
+        rows=[self.eod("2026-11-12",1000,700),
+              self.eod("2026-11-13",1010,810)]
+        sale=[{"activity_type":"FILL","id":"f","transaction_time":"2026-11-13T15:00:00Z",
+               "symbol":"ABC","side":"sell","qty":"1","price":"110"}]
+        series,dd,issues=self.benchmark(rows,sale)
+        self.assertEqual(issues,[])
+        self.assertEqual(series[-1]["account_net"],10)
+        self.assertAlmostEqual(series[-1]["account_index"],101)
+
+    def test_journal_and_instant_funding_block_benchmark(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-13",2000,2000)]
+        for kind in ("JNLC","ACATS","MEM","FOPT","UNRECOGNIZED"):
+            events=[{"activity_type":kind,"date":"2026-11-13",
+                     "net_amount":"1000"}]
+            series,dd,issues=self.benchmark(rows,events)
+            self.assertEqual(series,[])
+            self.assertIn("UNRECONCILED_ACTIVITY_"+kind,issues)
+
+    def test_missing_market_close_or_incomplete_activities_suspends(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              {"day":"2026-11-13","updated":"2026-11-13T15:00:00Z",
+               "equity":1000,"cash":1000}]
+        series,dd,issues=self.benchmark(rows)
+        self.assertEqual(series,[])
+        self.assertIn("NEED_TWO_COMPLETED_MARKET_DAYS",issues)
+        rows[-1]=self.eod("2026-11-13",1000,1000)
+        series,dd,issues=self.benchmark(rows,complete=False)
+        self.assertEqual(series,[])
+        self.assertIn("ACTIVITY_HISTORY_INCOMPLETE",issues)
+
+    def test_weekend_funding_maps_to_next_trading_close(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-13",1000,1000),
+              self.eod("2026-11-16",1200,1200)]
+        flow=[{"activity_type":"CSD","date":"2026-11-14","net_amount":"200"}]
+        series,dd,issues=self.benchmark(
+            rows,flow,prices={"2026-11-12":100,"2026-11-13":100,
+                              "2026-11-16":100})
+        self.assertEqual(issues,[])
+        self.assertEqual(series[-1]["account_index"],100)
+        self.assertEqual(series[-1]["cashflow"],200)
+
+    def test_missing_market_day_cannot_smuggle_cashflow_into_returns(self):
+        rows=[self.eod("2026-11-12",1000,1000),
+              self.eod("2026-11-16",1000,1000)]
+        series,dd,issues=self.benchmark(
+            rows,prices={"2026-11-12":100,"2026-11-13":100,
+                         "2026-11-16":100})
+        self.assertEqual(series,[])
+        self.assertIn("MISSING_DAILY_CLOSE_SNAPSHOT",issues)
+
     def test_trade_api_is_read_only(self):
         import inspect
         code=inspect.getsource(main.get)
