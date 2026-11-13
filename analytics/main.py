@@ -188,6 +188,157 @@ def refresh():
         LOG.exception("ANALYTICS_REFRESH_FAILED type=%s",type(e).__name__)
     finally:RUN.release()
 
+
+def verified_amount(value):
+    """Amounts used in return calculations must not silently become zero."""
+    if value is None or value == "":
+        raise ValueError("MISSING_AMOUNT")
+    result=Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError("NONFINITE_AMOUNT")
+    return result
+
+
+def completed_daily_snapshots(rows):
+    """Use the persisted 18:30 ET snapshot, never an intraday funding balance."""
+    out={}
+    for row in rows:
+        try:
+            ts=datetime.fromisoformat(str(row["updated"]).replace("Z","+00:00"))
+            if ts.tzinfo is None:
+                continue
+            ny=ts.astimezone(NY)
+            date=str(row["day"])
+            if ny.date().isoformat()!=date or (ny.hour,ny.minute)<(18,0):
+                continue
+            equity=verified_amount(row["equity"])
+            cash=verified_amount(row["cash"])
+            if equity<=0:continue
+            out[date]={"date":date,"equity":equity,"cash":cash}
+        except (ValueError,TypeError,OverflowError,ArithmeticError):
+            continue
+    return [out[k] for k in sorted(out)]
+
+
+def verified_spy_benchmark(account_rows,spy,activities,startday,activities_complete):
+    """Conservative end-of-day, external-cashflow-adjusted strategy comparison.
+
+    A contribution is NOT a gain: it is subtracted from account performance
+    and bought into the SPY comparison at the next available trading close.
+    Any unresolved funding/cash ledger or transfer suspends the return report.
+    """
+    snapshots=[x for x in completed_daily_snapshots(account_rows)
+               if x["date"]>=startday and x["date"] in spy and float(spy[x["date"]])>0]
+    issues=[]
+    if not activities_complete:
+        issues.append("ACTIVITY_HISTORY_INCOMPLETE")
+    if not snapshots or snapshots[0]["date"]!=startday:
+        issues.append("BASELINE_CLOSING_SNAPSHOT_MISSING")
+    if len(snapshots)<2:
+        issues.append("NEED_TWO_COMPLETED_MARKET_DAYS")
+    if issues:
+        return [],None,sorted(set(issues))
+    dates=[s["date"] for s in snapshots]
+    expected=[d for d in sorted(spy) if startday<=d<=dates[-1]
+              and float(spy[d])>0]
+    if dates!=expected:
+        issues.append("MISSING_DAILY_CLOSE_SNAPSHOT")
+    daily_external=defaultdict(lambda:Decimal("0"))
+    daily_internal=defaultdict(lambda:Decimal("0"))
+    # All cash-generating order fills are needed for ledger reconciliation.
+    # Non-cash corporate actions and journals are not guessed to be deposits.
+    cash_events={"CSD","CSW"}
+    internal_events={
+        "DIV","DIVCGL","DIVCGS","DIVFEE","DIVFT","DIVNRA","DIVROC",
+        "DIVTW","DIVTXEX","DIVWH","INT","INTNRA","INTTW","FEE","CFEE",
+        "CGD","CIL","PTC","PTR","CSR"
+    }
+    for event in activities:
+        kind=str(event.get("activity_type") or "").upper().strip()
+        if not kind:
+            issues.append("ACTIVITY_TYPE_MISSING")
+            continue
+        stamp=event.get("transaction_time") or event.get("date")
+        event_day=dateval(stamp)
+        if event_day is None:
+            issues.append("ACTIVITY_DATE_MISSING")
+            continue
+        if event_day<=startday or event_day>dates[-1]:
+            continue
+        # Weekend activity is applied to the first later observed market close.
+        day=next((d for d in dates[1:] if d>=event_day),None)
+        if day is None:
+            issues.append("UNMAPPED_ACTIVITY_DAY")
+            continue
+        try:
+            if kind=="FILL":
+                qty=verified_amount(event.get("qty"))
+                price=verified_amount(event.get("price"))
+                side=str(event.get("side") or "").lower()
+                if qty<=0 or price<=0 or side not in ("buy","sell"):
+                    raise ValueError("BAD_FILL")
+                daily_internal[day]+=(qty*price)*(1 if side=="sell" else -1)
+            elif kind in cash_events:
+                amount=abs(verified_amount(event.get("net_amount")))
+                if amount<=0:raise ValueError("BAD_TRANSFER")
+                daily_external[day]+=amount if kind=="CSD" else -amount
+            elif kind in internal_events:
+                daily_internal[day]+=verified_amount(event.get("net_amount"))
+            else:
+                # Includes ACAT*, JNL*, FOPT, MEM instant funding, FX, securities
+                # transfers and all unrecognized clearing codes.
+                issues.append("UNRECONCILED_ACTIVITY_"+kind)
+        except (ValueError,TypeError,InvalidOperation):
+            issues.append("INVALID_ACTIVITY_AMOUNT_OR_FILL_"+kind)
+    if issues:
+        return [],None,sorted(set(issues))
+    for prior,current in zip(snapshots,snapshots[1:]):
+        day=current["date"]
+        observed=current["cash"]-prior["cash"]
+        accounted=daily_external[day]+daily_internal[day]
+        tolerance=max(Decimal("2"),prior["equity"]*Decimal(".002"))
+        if abs(observed-accounted)>tolerance:
+            issues.append("CASH_LEDGER_MISMATCH_"+day)
+    if issues:
+        return [],None,sorted(set(issues))
+    first=snapshots[0]
+    start_price=Decimal(str(spy[startday]))
+    shares=first["equity"]/start_price
+    first_equity=first["equity"]
+    prior_equity=first_equity
+    net=Decimal(0)
+    twr=Decimal(1)
+    peak=Decimal(1)
+    max_dd=Decimal(0)
+    series=[]
+    for i,point in enumerate(snapshots):
+        day=point["date"]
+        cashflow=Decimal(0) if i==0 else daily_external[day]
+        if i:
+            net+=cashflow
+            shares+=cashflow/Decimal(str(spy[day]))
+            if shares<0:
+                return [],None,["WITHDRAWAL_EXCEEDS_SPY_HYPOTHETICAL"]
+            twr*=((point["equity"]-cashflow)/prior_equity)
+            if twr<=0:
+                return [],None,["NONPOSITIVE_RETURN_FACTOR"]
+        peak=max(peak,twr)
+        max_dd=min(max_dd,twr/peak-1)
+        hypothetical=shares*Decimal(str(spy[day]))
+        series.append({
+            "date":day,"equity":round(float(point["equity"]),2),
+            "spy_equity":round(float(hypothetical),2),
+            "account_net":round(float(point["equity"]-first_equity-net),2),
+            "spy_net":round(float(hypothetical-first_equity-net),2),
+            "account_index":round(float(twr*100),4),
+            "spy_index":round(float(Decimal(100)*Decimal(str(spy[day]))/start_price),4),
+            "cashflow":round(float(cashflow),2),
+            "cumulative_external_cashflow":round(float(net),2)
+        })
+        prior_equity=point["equity"]
+    return series,round(float(max_dd*100),2),[]
+
+
 def fifo(acts,ids):
     inventory=defaultdict(deque);sold=defaultdict(lambda:{"pnl":Decimal(0),"unknown":False,"matched":False,"by_source":defaultdict(lambda:Decimal(0))})
     fills=sorted((x for x in acts if x.get("activity_type")=="FILL"),key=lambda x:(str(x.get("transaction_time")),str(x.get("id"))))
@@ -232,55 +383,48 @@ def report():
             acts=[json.loads(x["data"]) for x in c.execute("SELECT data FROM activities")]
             ids={x["id"]:x["cid"] for x in c.execute("SELECT id,cid FROM orders")}
             equities=[(x["day"],x["value"]) for x in c.execute("SELECT day,value FROM equity ORDER BY day")]
+            # Persisted account rows are the authoritative post-close snapshots.
+            # The equity-history API and intraday values are DISPLAY ONLY.
+            account_rows=[dict(x) for x in c.execute("SELECT * FROM account ORDER BY day")]
             spy={x["day"]:x["price"] for x in c.execute("SELECT day,price FROM spy")}
             q=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
             quality=json.loads(q["val"]) if q else {}
             baseline_row=c.execute("SELECT val FROM meta WHERE key='benchmark_start'").fetchone()
             startday=baseline_row["val"] if baseline_row else acct["day"]
         finally:c.close()
-    flows=defaultdict(float);transfers=0;new_transfers=0
+    transfers=0;new_transfers=0
     for a in acts:
-        kind=a.get("activity_type")
-        if kind in ("CSD","CSW"):
-            day=dateval(a.get("transaction_time") or a.get("date"))
-            if day:flows[day]+=(1 if kind=="CSD" else -1)*abs(float(dec(a.get("net_amount"))))
-        if kind in ("ACATS","ACATC","JNLS","JNLC","REORG","SSP","SSO","MA","SC"):
+        kind=str(a.get("activity_type") or "").upper()
+        if kind in ("ACATS","ACATC","JNLS","JNLC","JNL","FOPT","MEM",
+                    "REORG","SSP","SSO","MA","SC","SPLIT","SPIN"):
             transfers+=1
             at_day=dateval(a.get("transaction_time") or a.get("date"))
-            if at_day and at_day>=startday:new_transfers+=1
+            if at_day and at_day>startday:new_transfers+=1
     covered=fifo(acts,ids)
-    series=[];eq=[(d,e) for d,e in equities if d>=startday and d in spy and e>0 and spy[d]>0]
     history=[{"date":d,"equity":round(e,2)} for d,e in equities if e>0]
-    if new_transfers or not quality.get("activities_complete"):
-        eq=[] # Forward benchmark not trustworthy until all post-baseline flows reconcile.
-    dd=0
-    if len(eq)>=2:
-        baseline,initial=eq[0];shares=initial/spy[baseline];net=0;unit=100;top=100;prev=initial
-        for i,(day,value) in enumerate(eq):
-            flow=flows[day] if i else 0
-            if i:
-                net+=flow;shares+=flow/spy[day]
-                growth=(value-flow)/prev if prev else 1
-                if 0<growth<10:unit*=growth
-            top=max(top,unit);dd=min(dd,(unit/top-1)*100)
-            hyp=shares*spy[day]
-            series.append({"date":day,"equity":round(value,2),"spy_equity":round(hyp,2),
-               "account_net":round(value-initial-net,2),"spy_net":round(hyp-initial-net,2),
-               "account_index":round(unit,4),"spy_index":round(100*spy[day]/spy[baseline],4)})
-            prev=value
+    series,drawdown,benchmark_issues=verified_spy_benchmark(
+        account_rows,spy,acts,startday,bool(quality.get("activities_complete")))
+    benchmark_status=("ready" if series else
+                      "suspended_reconciliation" if benchmark_issues and any(
+                          x not in ("NEED_TWO_COMPLETED_MARKET_DAYS","BASELINE_CLOSING_SNAPSHOT_MISSING")
+                          for x in benchmark_issues) else "awaiting_closing_data")
+    dd=drawdown if drawdown is not None else None
     warnings=["Observed FIFO realized P&L is provisional, before fees/taxes, not authoritative tax-lot accounting.",
       "Matched-cashflow SPY portfolio is hypothetical, with IEX adjusted close prices and end-of-day external flows."]
     if not quality.get("activities_complete"):warnings.append("Activity history is incomplete; exclude unverified results from decisions.")
     if not quality.get("orders_complete"):warnings.append("Order history incomplete; bot attribution may be missing.")
     if covered["unmatched_sells"]:warnings.append("Sells without observed matching buy lots excluded from realized results and win rate.")
     if transfers:warnings.append("Historical transfers/corporate actions detected: pre-baseline comparison would be unreliable.")
-    if new_transfers:warnings.append("Post-baseline transfers/corporate actions detected: SPY comparison suspended pending reconciliation.")
-    warnings.append("Forward SPY tracking starts on "+startday+"; historical equity remains visible but is not a validated strategy backtest.")
-    if not series:warnings.append("Forward SPY comparison requires two matched post-baseline market dates and reconciled cash flows.")
+    if new_transfers:warnings.append("Post-baseline transfers/corporate actions require cash-flow reconciliation.")
+    warnings.append("Benchmark uses saved AFTER-CLOSE account equity as the baseline and subtracts deposits/withdrawals from investment returns.")
+    warnings.append("Forward SPY tracking starts on "+startday+"; historical equity includes funding and is not an investment-return chart.")
+    if benchmark_issues:warnings.append("SPY comparison unavailable: "+", ".join(benchmark_issues))
+    if not series:warnings.append("No strategy-versus-SPY outperformance is claimed until closing balances and cash movements reconcile.")
     return {"status":"ok","as_of":acct["updated"],"account":{"day":acct["day"],"equity":round(acct["equity"],2),"cash":round(acct["cash"],2),"unrealized":round(acct["unrealized"],2),"positions":len(positions)},
       "positions":[{"symbol":x.get("symbol"),"qty":x.get("qty"),"value":float(dec(x.get("market_value"))),"unrealized":float(dec(x.get("unrealized_pl")))} for x in positions],
-      "trades":covered,"benchmark":{"baseline":series[0]["date"],"last":series[-1],"max_drawdown_pct_est":round(dd,2)} if series else None,
-      "series":series,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday},"last_error":LATEST_ERROR}
+      "trades":covered,"benchmark":{"baseline":series[0]["date"],"last":series[-1],"max_drawdown_pct_est":dd} if series else None,
+      "series":series,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday,
+      "benchmark_status":benchmark_status,"benchmark_issues":benchmark_issues},"last_error":LATEST_ERROR}
 
 def graph(points,keys):
     if len(points)<2:return '<p class="muted">Not enough comparable observations.</p>'
@@ -331,6 +475,7 @@ def dashboard(rep,rangeval):
       +'<section class="grid">'+boxes+'</section>'
       +'<nav>'+nav+' <a href="/api/report">Full JSON</a> <a href="/api/summary">Summary API</a> <a href="/export/snapshots.csv">CSV</a> <a href="/refresh">Refresh now</a></nav>'
       +'<section class="panel"><h2>Broker-reported total equity history</h2><p class="muted">Account equity includes deposits and withdrawals; this is not a return chart.</p>'+graph(history,[("equity","Alpaca equity")])+'</section>'
+      +'<section class="panel"><h2>SPY comparison verification</h2><p class="muted">Status: '+html.escape(rep["quality"]["benchmark_status"])+'; funding is excluded from investment performance. If deposits or cash activity cannot be reconciled, the return graphs remain unavailable.</p></section>'
       +'<section class="panel"><h2>Cash-flow-adjusted return index (start = 100)</h2><p class="muted">Approximate daily time-weighted Alpaca performance vs SPY dividend-adjusted return.</p>'+graph(p,[("account_index","Alpaca"),("spy_index","SPY")])+'</section>'
       +'<section class="panel"><h2>Actual equity vs hypothetical SPY equity</h2><p class="muted">Same starting balance and recorded deposits/withdrawals. Baseline '+html.escape(b["baseline"] if b else "pending")+'.</p>'+graph(p,[("equity","Alpaca"),("spy_equity","SPY")])+'</section>'
       +'<section class="panel"><h2>Net P&L after external cash flows</h2>'+graph(p,[("account_net","Alpaca"),("spy_net","SPY")])+'</section>'
