@@ -229,24 +229,50 @@ class SellerTests(unittest.TestCase):
         self.assertFalse(paper)
         self.assertFalse(client.options["paper"])
 
+
+    def test_highwater_observer_does_not_submit_any_orders(self):
+        client=FakeClient([pos(price="121",pnl="0.21")])
+        with patch.object(main,"clients",return_value=(client,False,False)),patch.object(
+            main.hwm_tracker,"observe",return_value={"observed":1}) as observer:
+            main.observe_highwater()
+        self.assertEqual(client.submitted,[])
+        observer.assert_called_once()
+        self.assertEqual(len(observer.call_args[0][0]),1)
+
+    def test_highwater_observer_skips_market_closed(self):
+        client=FakeClient(open_=False)
+        client.get_all_positions=lambda: (_ for _ in ()).throw(AssertionError())
+        with patch.object(main,"clients",return_value=(client,False,False)),patch.object(
+            main.hwm_tracker,"observe") as observer:
+            main.observe_highwater()
+        observer.assert_not_called()
+        self.assertEqual(client.submitted,[])
+
     def test_scheduler_uses_ny_market_hours_and_no_cron(self):
         trace={}
         class Stub:
             def __init__(self,**kw):trace["init"]=kw
-            def add_job(self,*a,**kw):trace["job"]=(a,kw)
+            def add_job(self,*a,**kw):trace.setdefault("jobs",[]).append((a,kw))
             def start(self):trace["start"]=True
         mods=sdk_stub()
         for name in ("apscheduler","apscheduler.schedulers","apscheduler.schedulers.blocking"):
             mods[name]=types.ModuleType(name)
         mods["apscheduler.schedulers.blocking"].BlockingScheduler=Stub
         with patch.dict(sys.modules,mods), patch("sys.argv",["main.py"]):
-            with patch.object(main,"clients",return_value=(None,False,False)):
+            with patch.object(main,"clients",return_value=(None,False,False)),patch.object(
+                main.hwm_tracker,"connect",return_value=SimpleNamespace(close=lambda: None)):
                 main.main()
         self.assertTrue(trace["start"])
         self.assertEqual(trace["init"]["timezone"],main.NEW_YORK)
-        self.assertEqual(trace["job"][1]["day_of_week"],"mon-fri")
-        self.assertEqual(trace["job"][1]["hour"],"9-15")
-        self.assertEqual(trace["job"][1]["minute"],35)
+        self.assertEqual(len(trace["jobs"]),2)
+        seller=next(k for a,k in trace["jobs"] if k["id"]=="v2_seller_hourly")
+        observer=next(k for a,k in trace["jobs"] if k["id"]=="v2_highwater_observer")
+        self.assertEqual(seller["day_of_week"],"mon-fri")
+        self.assertEqual(seller["hour"],"9-15")
+        self.assertEqual(seller["minute"],35)
+        self.assertEqual(observer["hour"],"9-15")
+        self.assertEqual(observer["minute"],"2,12,22,32,42,52")
+        self.assertEqual(observer["day_of_week"],"mon-fri")
 
 
 if __name__=="__main__":
