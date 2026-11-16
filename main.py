@@ -1,10 +1,12 @@
-"""V2 SELLER: hourly +10% exits and -5% stops only for non-S&P 100 stocks.
+"""V2 SELLER: armed +13% / 3-point profit giveback, min +10%; non-SP100 -5% stops.
 
 Always-on Railway worker, 09:35–15:35 Eastern on trading weekdays.
-S&P 100 membership is verified against the V2 Screener constituent sheet.
-If membership verification fails, stop-loss exits are disabled; +10% exits
-remain active. This is an hourly price trigger, NOT a broker-native stop order.
-Only long US equities, one full-position market exit per symbol/day.
+Profit exits require persisted high-water observations since this position
+episode started, confirmed +13% peak and a >=3 percentage-point retracement,
+while current broker gain remains >=10%. Profit exits use DAY limit sells at
+no less than 110% of average entry; these may NOT fill. Conditional -5% loss
+exits use market sells for stocks not in the verified S&P100 membership.
+This is hourly decision-making, not continuous market protection.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_CEILING
 from zoneinfo import ZoneInfo
 
 import hwm_tracker
@@ -76,10 +78,47 @@ def position_stop_loss_trigger(position)->bool:
     except ValueError:return False
 
 
-def exit_trigger(position,symbol,members):
-    """Gain exit for all equities; loss exit only when known not to be in S&P 100."""
-    if position_profit_trigger(position):
-        return "GAIN_GE_10_PCT"
+def position_giveback_trigger(position,peak):
+    """Profit exit only on verified retracement from this held episode's peak."""
+    if not peak or not position_profit_trigger(position):
+        return False
+    info=hwm_tracker.metric(position)
+    if not info:return False
+    try:
+        old_entry=dec(peak["avg_entry"])
+        old_qty=dec(peak["last_qty"])
+        high=dec(peak["peak_gain_pct"])
+        price=info["price"]
+        entry=info["entry"]
+        qty=info["qty"]
+        broker_gain=dec(getattr(position,"unrealized_plpc",None))*Decimal(100)
+        if old_entry<=0 or old_qty<=0 or high<hwm_tracker.ARM_PCT:return False
+        # New purchases / average cost changes start a new tracked position.
+        if abs(entry-old_entry)>max(Decimal(".000001"),old_entry*Decimal(".00001")):
+            return False
+        if qty>old_qty+Decimal(".0000001"):return False
+        threshold=max(hwm_tracker.MIN_GAIN_PCT,high-hwm_tracker.GIVEBACK_POINTS)
+        computed_gain=(price/entry-1)*Decimal(100)
+        # Both independently reported gain values must satisfy both sides.
+        return (min(computed_gain,broker_gain)>=hwm_tracker.MIN_GAIN_PCT
+                and max(computed_gain,broker_gain)<=threshold)
+    except (ValueError,KeyError,TypeError):
+        return False
+
+
+def profit_floor_limit(position):
+    """Exchange-valid sell limit priced at least +10% vs. average entry."""
+    cost=dec(getattr(position,"avg_entry_price",None))
+    if cost<=0:raise ValueError("INVALID_PROFIT_LIMIT_BASIS")
+    raw=cost*(Decimal(1)+TAKE_PROFIT)
+    tick=Decimal(".01") if raw>=1 else Decimal(".0001")
+    return (raw/tick).to_integral_value(rounding=ROUND_CEILING)*tick
+
+
+def exit_trigger(position,symbol,members,peak=None):
+    """Prioritize the high-water profit exit; preserve non-SP100 -5% stops."""
+    if position_giveback_trigger(position,peak):
+        return "GAIN_TRAILING_3PTS_MIN_10PCT"
     if members is not None and symbol not in members and position_stop_loss_trigger(position):
         return "LOSS_LE_5_PCT_NON_SP100"
     return None
@@ -192,7 +231,7 @@ def market_snapshot(client):
 
 def check_once(client,*,dry_run,now=None):
     from alpaca.trading.enums import OrderSide,TimeInForce
-    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest,LimitOrderRequest
     now=now or datetime.now(timezone.utc)
     clock=client.get_clock()
     if not clock.is_open:
@@ -201,11 +240,22 @@ def check_once(client,*,dry_run,now=None):
     blocked=market_snapshot(client)
     positions=client.get_all_positions()
     if positions is None:raise RuntimeError("BROKER_POSITIONS_UNVERIFIABLE")
+    # Persist first, then evaluate: a fresh observed peak can arm, but must
+    # actually retrace before the first profit exit. A storage error disables
+    # ONLY gain exits; existing conditional -5% stops remain active.
+    try:
+        if not dry_run:
+            hwm_tracker.observe(positions,path=hwm_tracker.DB_PATH,at=now)
+        peak_records=hwm_tracker.active_peak_records(path=hwm_tracker.DB_PATH)
+    except Exception as exc:
+        peak_records={}
+        LOG.error("HWM_READ_UNAVAILABLE type=%s profit_exits_disabled=TRUE",
+                  type(exc).__name__)
     try:
         members=load_sp100_membership(now)
     except Exception as exc:
         # Do not guess index membership or treat "unknown" as non-S&P100.
-        # The existing +10% profit exits remain available.
+        # High-water profit exits remain available if the stored peak is valid.
         members=None
         LOG.error("SP100_MEMBERSHIP_UNAVAILABLE error_type=%s; STOP_LOSS_DISABLED",
                   type(exc).__name__)
@@ -219,7 +269,7 @@ def check_once(client,*,dry_run,now=None):
         cls=str(getattr(getattr(p,"asset_class",None),"value",getattr(p,"asset_class",None))).lower()
         side=str(getattr(getattr(p,"side",None),"value",getattr(p,"side",None))).lower()
         if cls!="us_equity" or side!="long":continue
-        trigger=exit_trigger(p,sym,members)
+        trigger=exit_trigger(p,sym,members,peak_records.get(sym))
         if trigger is None:continue
         eligible+=1
         if sym in blocked:
@@ -236,7 +286,7 @@ def check_once(client,*,dry_run,now=None):
             break
         current=client.get_open_position(sym)
         if (str(getattr(getattr(current,"side",None),"value",getattr(current,"side",None))).lower()!="long"
-            or exit_trigger(current,sym,members)!=trigger):
+            or exit_trigger(current,sym,members,peak_records.get(sym))!=trigger):
             LOG.info("SELL_SKIP_TRIGGER_MOVED symbol=%s trigger=%s",sym,trigger)
             continue
         if sym in market_snapshot(client):
@@ -248,14 +298,25 @@ def check_once(client,*,dry_run,now=None):
             continue
         if dry_run:
             previews+=1
-            LOG.info("SELL_PREVIEW symbol=%s qty=%s broker_gain=%s trigger=%s",
-                     sym,qty,current.unrealized_plpc,trigger)
+            LOG.info("SELL_PREVIEW symbol=%s qty=%s broker_gain=%s trigger=%s limit_floor=%s",
+                     sym,qty,current.unrealized_plpc,trigger,
+                     str(profit_floor_limit(current)) if trigger.startswith("GAIN_") else "MARKET")
             continue
         # Limit to exactly one broker POST; on an ambiguous network error
         # do not retry this run, and reconcile by client ID next cycle.
-        request=MarketOrderRequest(symbol=sym,qty=float(qty),
-            side=OrderSide.SELL,time_in_force=TimeInForce.DAY,
-            client_order_id=cid,extended_hours=False)
+        if trigger.startswith("GAIN_"):
+            # A market sell can slip below +10%; a sell limit cannot execute
+            # beneath this pre-fee floor, but may remain unfilled / expire.
+            floor=profit_floor_limit(current)
+            request=LimitOrderRequest(symbol=sym,qty=float(qty),
+                side=OrderSide.SELL,time_in_force=TimeInForce.DAY,
+                client_order_id=cid,limit_price=float(floor),
+                extended_hours=False)
+        else:
+            # Preserve market-order downside stops exactly as before.
+            request=MarketOrderRequest(symbol=sym,qty=float(qty),
+                side=OrderSide.SELL,time_in_force=TimeInForce.DAY,
+                client_order_id=cid,extended_hours=False)
         try:
             response=client.submit_order(order_data=request)
         except Exception:
@@ -263,8 +324,10 @@ def check_once(client,*,dry_run,now=None):
             raise RuntimeError("SELL_ORDER_STATUS_UNCERTAIN_NO_RETRY") from None
         blocked.add(sym)
         submitted+=1
-        LOG.warning("LIVE_SELL_SENT symbol=%s cid=%s order_id=%s trigger=%s",
-                    sym,cid,getattr(response,"id","ACK_PENDING"),trigger)
+        LOG.warning("LIVE_SELL_SENT symbol=%s cid=%s order_id=%s trigger=%s order_type=%s limit_floor=%s",
+                    sym,cid,getattr(response,"id","ACK_PENDING"),trigger,
+                    "LIMIT" if trigger.startswith("GAIN_") else "MARKET",
+                    str(floor) if trigger.startswith("GAIN_") else "NONE")
     LOG.info("SELL_CYCLE_COMPLETE eligible=%d submitted=%d preview=%d",
              eligible,submitted,previews)
     return {"status":"OK","eligible":eligible,"submitted":submitted,"preview":previews}
@@ -296,7 +359,7 @@ def observe_highwater():
         current=trader.get_all_positions()
         if current is None:
             raise RuntimeError("HWM_BROKER_POSITIONS_UNAVAILABLE")
-        hwm_tracker.observe(current)
+        hwm_tracker.observe(current,path=hwm_tracker.DB_PATH)
     except Exception as exc:
         # Monitoring failure must not change the established live exit rules.
         LOG.error("HWM_MONITOR_FAILED error_type=%s existing_sell_logic_unchanged=TRUE",
@@ -356,9 +419,9 @@ def main():
     scheduler.add_job(observe_highwater,"cron",day_of_week="mon-fri",
         hour="9-15",minute="2,12,22,32,42,52",id="v2_highwater_observer",
         replace_existing=True)
-    LOG.info("HWM_OBSERVER_STARTED interval=10min market_hours=TRUE observation_only=TRUE shadow_giveback_points=3")
+    LOG.info("HWM_OBSERVER_STARTED interval=10min market_hours=TRUE peak_tracking=TRUE giveback_points=3")
     LOG.info("V2_SELLER_STARTED schedule=09:35..15:35 America/New_York"
-             " every_hour=TRUE take_profit=10pct non_sp100_stop_loss=-5pct mode=%s dry_run=%s",
+             " every_hour=TRUE profit_arm=13pct giveback=3pts profit_floor_limit=10pct non_sp100_stop_loss=-5pct mode=%s dry_run=%s",
              "PAPER" if paper else "LIVE",dry)
     scheduler.start()
 

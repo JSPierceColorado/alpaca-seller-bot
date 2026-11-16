@@ -1,6 +1,6 @@
-"""Persistent, observation-only high-water gains for the V2 seller.
+"""Persistent position high-water gain history for the V2 seller.
 
-No order APIs, no order instructions. A gain is measured against the currently
+No order APIs or order instructions live in this module. A gain is measured against the currently
 reported broker average cost. Peaks start when observation is enabled; they
 are NOT historical/intraday highs. New purchases or a changed cost basis
 rebase the tracked position rather than importing an old position's peak.
@@ -49,8 +49,7 @@ def connect(path=DB_PATH):
         peak_gain_pct TEXT NOT NULL, reason TEXT NOT NULL)""")
     connection.execute("""CREATE TABLE IF NOT EXISTS tracker_meta(
         key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
-    # Immutable price-path observations enable later comparisons of 2, 3 and
-    # 5 percentage-point givebacks without changing any live trading rule.
+    # Retain the price path to evaluate alternative giveback rules later.
     connection.execute("""CREATE TABLE IF NOT EXISTS peak_samples(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL, episode_start TEXT NOT NULL,
@@ -84,6 +83,19 @@ def metric(position):
         # Do not record a high mark on stale/conflicting quote/cost fields.
         return None
     return {"symbol":symbol,"entry":entry,"price":price,"qty":qty,"gain":gain}
+
+
+def active_peak_records(*, path=DB_PATH):
+    """Read only the current portfolio's persisted position-episode peaks.
+
+    Never synthesize a missing high-water mark. Storage failures propagate to
+    the caller, which must disable gain exits rather than sell at +10%.
+    """
+    with closing(connect(path)) as conn:
+        return {row["symbol"]:dict(row) for row in conn.execute(
+            "SELECT symbol,first_seen,last_seen,avg_entry,last_qty,"
+            "peak_price,peak_gain_pct,peak_seen,current_gain_pct,observations "
+            "FROM active_peaks")}
 
 
 def observe(positions, *, path=DB_PATH, at=None):
@@ -179,7 +191,7 @@ def observe(positions, *, path=DB_PATH, at=None):
                 trailing_exit=max(MIN_GAIN_PCT,peak-GIVEBACK_POINTS)
                 if MIN_GAIN_PCT<=gain<=trailing_exit:
                     summary["shadow_givebacks"]+=1
-                    LOG.info("HWM_SHADOW_GIVEBACK symbol=%s gain_pct=%s peak_pct=%s trigger_pct=%s NO_ORDER",
+                    LOG.info("HWM_GIVEBACK_OBSERVED symbol=%s gain_pct=%s peak_pct=%s trigger_pct=%s no_order_from_observer=TRUE",
                              symbol,round(gain,3),round(peak,3),round(trailing_exit,3))
         for symbol,old in known.items():
             if symbol not in all_equity:

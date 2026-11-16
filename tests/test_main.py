@@ -1,5 +1,6 @@
 """Offline seller tests; no keys, real trades, or network connections."""
 import os
+import tempfile
 import sys
 import types
 import unittest
@@ -61,6 +62,7 @@ def sdk_stub():
     modules["alpaca.trading.enums"].TimeInForce=SimpleNamespace(DAY="day")
     modules["alpaca.trading.requests"].GetOrdersRequest=OrderRequest
     modules["alpaca.trading.requests"].MarketOrderRequest=OrderRequest
+    modules["alpaca.trading.requests"].LimitOrderRequest=OrderRequest
     modules["alpaca.common.exceptions"].APIError=APIError
     return modules
 
@@ -71,6 +73,23 @@ class SellerTests(unittest.TestCase):
             main,"load_sp100_membership",return_value={"KO","JNJ","PG","BRK.B"})
         self.membership_patcher.start()
         self.addCleanup(self.membership_patcher.stop)
+        self.tmpdir=tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dbpath=os.path.join(self.tmpdir.name,"seller-peaks.sqlite3")
+        db_patcher=patch.object(main.hwm_tracker,"DB_PATH",self.dbpath)
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+
+    def seed_peak(self,position=None,peak_price="115"):
+        position=position or pos()
+        old_price=position.current_price
+        old_ratio=position.unrealized_plpc
+        entry=Decimal(position.avg_entry_price)
+        position.current_price=peak_price
+        position.unrealized_plpc=str(Decimal(peak_price)/entry-1)
+        main.hwm_tracker.observe([position],path=self.dbpath,at=NOW)
+        position.current_price=old_price
+        position.unrealized_plpc=old_ratio
 
     def test_exact_profit_threshold(self):
         self.assertFalse(main.position_profit_trigger(pos(price="80",pnl="-0.20")))
@@ -82,6 +101,7 @@ class SellerTests(unittest.TestCase):
 
     def test_submits_exactly_one_live_exit_with_full_fractional_qty(self):
         client=FakeClient()
+        self.seed_peak(client.positions[0])
         with patch.dict(sys.modules,sdk_stub()):
             a=main.check_once(client,dry_run=False,now=NOW)
             b=main.check_once(client,dry_run=False,now=NOW)
@@ -94,11 +114,13 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(x["time_in_force"],"day")
         self.assertEqual(x["client_order_id"],"v2s-20261109-KO")
         self.assertFalse(x["extended_hours"])
+        self.assertEqual(x["limit_price"],110.0)
         self.assertNotIn("stop_loss",x)
         self.assertNotIn("take_profit",x)
 
     def test_dry_run_never_sends(self):
         client=FakeClient()
+        self.seed_peak(client.positions[0])
         with patch.dict(sys.modules,sdk_stub()):
             r=main.check_once(client,dry_run=True,now=NOW)
         self.assertEqual(r["preview"],1)
@@ -150,11 +172,86 @@ class SellerTests(unittest.TestCase):
     def test_unavailable_membership_disables_only_loss_exits(self):
         client=FakeClient([pos(sym="QLYS",price="80",pnl="-.20"),
                            pos(sym="KO",price="110",pnl=".10")])
+        self.seed_peak(client.positions[1],peak_price="113")
         with patch.object(main,"load_sp100_membership",side_effect=RuntimeError("offline")):
             with patch.dict(sys.modules,sdk_stub()):
                 report=main.check_once(client,dry_run=False,now=NOW)
         self.assertEqual(report["submitted"],1)
         self.assertEqual(client.submitted[0]["symbol"],"KO")
+
+
+    def test_profit_does_not_sell_at_initial_ten_twelve_or_thirteen(self):
+        for pct in ("0.10","0.12","0.13"):
+            price=str(Decimal("100")*(Decimal(1)+Decimal(pct)))
+            client=FakeClient([pos(price=price,pnl=pct)])
+            with patch.dict(sys.modules,sdk_stub()):
+                result=main.check_once(client,dry_run=False,now=NOW)
+            self.assertEqual(result["submitted"],0,
+                             "No immediate fixed 10% profit sell")
+            self.assertEqual(client.submitted,[])
+
+    def test_13_peak_then_10_giveback_sells_at_limit_floor(self):
+        current=pos(sym="KO",price="110",pnl="0.10",qty="1.25")
+        self.seed_peak(current,peak_price="113")
+        client=FakeClient([current])
+        with patch.dict(sys.modules,sdk_stub()):
+            out=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(out["submitted"],1)
+        order=client.submitted[0]
+        self.assertEqual(order["limit_price"],110)
+        self.assertEqual(order["qty"],1.25)
+
+    def test_20_peak_then_17_sells_and_17point01_does_not(self):
+        for price,should_submit in (("117.01",0),("117",1)):
+            current=pos(sym="KO",price=price,
+                        pnl=str(Decimal(price)/Decimal(100)-1))
+            self.seed_peak(current,peak_price="120")
+            broker=FakeClient([current])
+            with patch.dict(sys.modules,sdk_stub()):
+                out=main.check_once(broker,dry_run=False,now=NOW)
+            self.assertEqual(out["submitted"],should_submit)
+            if should_submit:
+                self.assertEqual(broker.submitted[0]["limit_price"],110)
+
+    def test_armed_peak_does_not_order_if_gain_below_10(self):
+        current=pos(price="109",pnl=".09")
+        self.seed_peak(current,peak_price="120")
+        broker=FakeClient([current])
+        with patch.dict(sys.modules,sdk_stub()):
+            self.assertEqual(main.check_once(broker,dry_run=False,now=NOW)["submitted"],0)
+        self.assertEqual(broker.submitted,[])
+
+    def test_profit_limit_rounded_up_not_below_ten_percent(self):
+        self.assertEqual(main.profit_floor_limit(pos(price="115",cost="100.005",pnl=".14")),Decimal("110.01"))
+        self.assertEqual(main.profit_floor_limit(pos(price="0.95",cost="0.8",pnl=".1875")),Decimal(".88"))
+        self.assertEqual(main.profit_floor_limit(pos(price="1.20",cost="1.01",pnl=".188")),Decimal("1.12"))
+
+    def test_storage_unavailable_disables_profit_but_not_stop_loss(self):
+        client=FakeClient([pos(sym="KO",price="110",pnl=".10"),
+                           pos(sym="QLYS",price="94",pnl="-.06")])
+        with patch.dict(sys.modules,sdk_stub()),patch.object(
+            main.hwm_tracker,"active_peak_records",side_effect=OSError("disk unavailable")):
+            out=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(out["submitted"],1)
+        self.assertEqual(client.submitted[0]["symbol"],"QLYS")
+        self.assertNotIn("limit_price",client.submitted[0])
+
+    def test_buy_addition_rebases_and_rejects_old_peak(self):
+        current=pos(price="111",pnl=".11",qty="1")
+        self.seed_peak(current,peak_price="120")
+        current.qty="1.5"
+        client=FakeClient([current])
+        with patch.dict(sys.modules,sdk_stub()):
+            self.assertEqual(main.check_once(client,dry_run=False,now=NOW)["submitted"],0)
+        self.assertEqual(client.submitted,[])
+
+    def test_inconsistent_broker_price_gain_never_triggers_profit(self):
+        current=pos(price="110",pnl=".14")
+        self.seed_peak(current,peak_price="120")
+        client=FakeClient([current])
+        with patch.dict(sys.modules,sdk_stub()):
+            self.assertEqual(main.check_once(client,dry_run=False,now=NOW)["submitted"],0)
+        self.assertEqual(client.submitted,[])
 
     def test_membership_snapshot_validates_freshness_and_completeness(self):
         head=["symbol","close","sma_200","sma_50","pos_52w",
@@ -184,6 +281,7 @@ class SellerTests(unittest.TestCase):
     def test_pending_nested_order_blocks_sell(self):
         client=FakeClient(orders=[SimpleNamespace(symbol="AAPL",legs=[
             SimpleNamespace(symbol="KO",legs=None)])])
+        self.seed_peak(client.positions[0])
         with patch.dict(sys.modules,sdk_stub()):
             a=main.check_once(client,dry_run=False,now=NOW)
         self.assertEqual(a["submitted"],0)
@@ -197,6 +295,7 @@ class SellerTests(unittest.TestCase):
 
     def test_ambiguous_post_no_retry(self):
         client=FakeClient()
+        self.seed_peak(client.positions[0])
         def unknown(order_data):
             raise TimeoutError("mock client error after write")
         client.submit_order=unknown
