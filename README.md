@@ -25,8 +25,7 @@ Railway Cron. The Railway service is restarted automatically if its process fail
 - No broker-native trailing stops, short selling, options, or buy logic. Hourly non-SP100 -5% stops remain **market** exits, not broker-resident stop orders; overnight gaps and price moves can produce losses beyond 5%. Profit exits use limit prices and can remain unfilled.
 - Skip if any open order exists for a position (including nested legs).
 - Recheck market clock, position and open orders immediately before sending.
-- Broker `client_order_id` is stable for the day and symbol:
-  `v2s-YYYYMMDD-SYMBOL`. Before sending, query Alpaca for that ID.
+- Broker `client_order_id` is stable for the day, symbol, and exit reason: `v2sl-YYYYMMDD-SYMBOL` for a **non-SP100 −5% stop-loss**, `v2sg-YYYYMMDD-SYMBOL` for a trailing **profit** exit. The seller checks both markers plus legacy `v2s-YYYYMMDD-SYMBOL` before sending, preserving one sale attempt per symbol/day. Each buyer checks only *filled* `v2sl-` sells submitted since this week’s Monday 00:00 New York time. Stop-loss exit on Monday blocks repurchases through Sunday, but a Friday stop expires that Monday; profitable exits never cause this lockout. Historical generic `v2s-` orders cannot reliably be classified retrospectively.
   Network uncertainty aborts the current cycle without blind retries.
 - Profit DAY limit orders should not fill below their price limits, but may remain unfilled. Commissions, fees, taxes, funding interest, and evolving average cost can mean the final net return is not precisely +10%. Conditional loss exits retain market-order slippage risks.
 - Peaks are measured from when monitoring was activated for the current position episode, not an exchange-sourced all-time price high. Re-entry or additional shares can change a position's cost basis and reset its peak.

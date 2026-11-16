@@ -112,7 +112,7 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(x["qty"],0.612345678)
         self.assertEqual(x["side"],"sell")
         self.assertEqual(x["time_in_force"],"day")
-        self.assertEqual(x["client_order_id"],"v2s-20261109-KO")
+        self.assertEqual(x["client_order_id"],"v2sg-20261109-KO")
         self.assertFalse(x["extended_hours"])
         self.assertEqual(x["limit_price"],110.0)
         self.assertNotIn("stop_loss",x)
@@ -161,7 +161,7 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(second["submitted"],0)
         self.assertEqual(len(client.submitted),1)
         self.assertEqual(client.submitted[0]["qty"],0.512345678)
-        self.assertEqual(client.submitted[0]["client_order_id"],"v2s-20261109-QLYS")
+        self.assertEqual(client.submitted[0]["client_order_id"],"v2sl-20261109-QLYS")
 
     def test_non_sp100_does_not_stop_before_five_percent(self):
         client=FakeClient([pos(sym="QLYS",price="95.5",pnl="-.045")])
@@ -179,6 +179,22 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(report["submitted"],1)
         self.assertEqual(client.submitted[0]["symbol"],"KO")
 
+
+    def test_seller_order_ids_label_stop_not_profit(self):
+        self.assertEqual(main.unique_id("2026-11-16","TTMI","LOSS_LE_5_PCT_NON_SP100"),
+                         "v2sl-20261116-TTMI")
+        self.assertEqual(main.unique_id("2026-11-16","TTMI","GAIN_TRAILING_3PTS_MIN_10PCT"),
+                         "v2sg-20261116-TTMI")
+        self.assertEqual(len(main.daily_sell_ids("2026-11-16","TTMI")),3)
+        self.assertIn("v2s-20261116-TTMI",main.daily_sell_ids("2026-11-16","TTMI"))
+
+    def test_profit_and_stop_share_daily_idempotency(self):
+        client=FakeClient([pos(sym="QLYS",price="94",pnl="-.06")])
+        client.clientids.add("v2sg-20261109-QLYS")
+        with patch.dict(sys.modules,sdk_stub()):
+            result=main.check_once(client,dry_run=False,now=NOW)
+        self.assertEqual(result["submitted"],0)
+        self.assertEqual(client.submitted,[])
 
     def test_profit_does_not_sell_at_initial_ten_twelve_or_thirteen(self):
         for pct in ("0.10","0.12","0.13"):

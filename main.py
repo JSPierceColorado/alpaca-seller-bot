@@ -191,10 +191,24 @@ def load_sp100_membership(now=None):
     return members
 
 
-def unique_id(day,symbol):
+def unique_id(day,symbol,trigger=None):
+    """Loss and profit IDs encode cause for both independent buyers.
+
+    v2sl is specifically a non-SP100 stop-loss; v2sg is a profit exit.
+    Older v2s IDs remain checked for same-day idempotency, but cannot be
+    classified retroactively as a gain or a stop by buyers.
+    """
     if not SYMBOL.fullmatch(symbol):
         raise ValueError("Unsupported stock ticker")
-    return ("v2s-"+day.replace("-","")+"-"+symbol.replace(".","-"))[:48]
+    prefix=("v2sl-" if trigger=="LOSS_LE_5_PCT_NON_SP100" else
+            "v2sg-" if trigger=="GAIN_TRAILING_3PTS_MIN_10PCT" else
+            "v2s-")
+    return (prefix+day.replace("-","")+"-"+symbol.replace(".","-"))[:48]
+
+
+def daily_sell_ids(day,symbol):
+    return {unique_id(day,symbol),unique_id(day,symbol,"LOSS_LE_5_PCT_NON_SP100"),
+            unique_id(day,symbol,"GAIN_TRAILING_3PTS_MIN_10PCT")}
 
 
 def already_submitted(client,cid):
@@ -275,8 +289,10 @@ def check_once(client,*,dry_run,now=None):
         if sym in blocked:
             LOG.info("SELL_SKIP_OPEN_ORDER symbol=%s",sym)
             continue
-        cid=unique_id(date,sym)
-        if already_submitted(client,cid):
+        cid=unique_id(date,sym,trigger)
+        # Preserve global per-symbol same-day idempotency across BOTH exit
+        # reasons, and don't replay existing old-format v2s IDs.
+        if any(already_submitted(client,old_id) for old_id in sorted(daily_sell_ids(date,sym))):
             LOG.info("SELL_SKIP_PREVIOUS_ATTEMPT symbol=%s",sym)
             continue
         # The market/account/position could change between reads. Verify
