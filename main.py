@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
+import hwm_tracker
+
 LOG=logging.getLogger("v2-seller")
 NEW_YORK=ZoneInfo("America/New_York")
 TAKE_PROFIT=Decimal("0.10")
@@ -284,6 +286,23 @@ def clients():
     return TradingClient(api_key=key,secret_key=secret,paper=paper),dry,paper
 
 
+
+def observe_highwater():
+    """Read-only high-water observation; never enters the seller's order path."""
+    try:
+        trader,_,_=clients()
+        if not trader.get_clock().is_open:
+            return
+        current=trader.get_all_positions()
+        if current is None:
+            raise RuntimeError("HWM_BROKER_POSITIONS_UNAVAILABLE")
+        hwm_tracker.observe(current)
+    except Exception as exc:
+        # Monitoring failure must not change the established live exit rules.
+        LOG.error("HWM_MONITOR_FAILED error_type=%s existing_sell_logic_unchanged=TRUE",
+                  type(exc).__name__)
+
+
 def scheduled_check():
     try:
         trader,dry,paper=clients()
@@ -315,6 +334,13 @@ def main():
     # Validate mode and keys immediately, before claiming service is ready.
     _,dry,paper=clients()
     try:
+        db=hwm_tracker.connect()
+        db.close()
+        LOG.info("HWM_TRACKER_READY path=%s observation_only=TRUE",hwm_tracker.DB_PATH)
+    except Exception as exc:
+        LOG.error("HWM_TRACKER_STORAGE_ERROR type=%s existing_sell_logic_unchanged=TRUE",
+                  type(exc).__name__)
+    try:
         LOG.info("SP100_STARTUP_PREFLIGHT_OK members=%d",len(load_sp100_membership()))
     except Exception as exc:
         LOG.error("SP100_STARTUP_PREFLIGHT_FAILED error_type=%s; STOP_LOSS_DISABLED_UNTIL_VERIFIED",
@@ -325,6 +351,12 @@ def main():
     scheduler.add_job(scheduled_check,"cron",day_of_week="mon-fri",
         hour="9-15",minute=35,id="v2_seller_hourly",
         replace_existing=True)
+    # These checks only read account positions. They don't submit broker orders.
+    # Run off-minute to avoid colliding with the established hourly seller.
+    scheduler.add_job(observe_highwater,"cron",day_of_week="mon-fri",
+        hour="9-15",minute="2,12,22,32,42,52",id="v2_highwater_observer",
+        replace_existing=True)
+    LOG.info("HWM_OBSERVER_STARTED interval=10min market_hours=TRUE observation_only=TRUE shadow_giveback_points=3")
     LOG.info("V2_SELLER_STARTED schedule=09:35..15:35 America/New_York"
              " every_hour=TRUE take_profit=10pct non_sp100_stop_loss=-5pct mode=%s dry_run=%s",
              "PAPER" if paper else "LIVE",dry)
