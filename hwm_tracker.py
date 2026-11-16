@@ -49,6 +49,16 @@ def connect(path=DB_PATH):
         peak_gain_pct TEXT NOT NULL, reason TEXT NOT NULL)""")
     connection.execute("""CREATE TABLE IF NOT EXISTS tracker_meta(
         key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+    # Immutable price-path observations enable later comparisons of 2, 3 and
+    # 5 percentage-point givebacks without changing any live trading rule.
+    connection.execute("""CREATE TABLE IF NOT EXISTS peak_samples(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL, episode_start TEXT NOT NULL,
+        observed_at TEXT NOT NULL, avg_entry TEXT NOT NULL,
+        qty TEXT NOT NULL, current_price TEXT NOT NULL,
+        gain_pct TEXT NOT NULL, peak_gain_pct TEXT NOT NULL)""")
+    connection.execute("""CREATE INDEX IF NOT EXISTS sample_symbol_episode_time
+        ON peak_samples(symbol,episode_start,observed_at)""")
     connection.commit()
     return connection
 
@@ -157,6 +167,13 @@ def observe(positions, *, path=DB_PATH, at=None):
                         avg_entry=?,last_qty=?,current_gain_pct=?,
                         observations=observations+1 WHERE symbol=?""",
                         (stamp,str(entry),str(qty),str(gain),symbol))
+            # Store every valid observation, not just record highs. The
+            # interval path matters for evaluating future giveback choices.
+            conn.execute("""INSERT INTO peak_samples(
+                symbol,episode_start,observed_at,avg_entry,qty,current_price,
+                gain_pct,peak_gain_pct) VALUES(?,?,?,?,?,?,?,?)""",
+                (symbol,old["first_seen"] if old else stamp,stamp,
+                 str(entry),str(qty),str(price),str(gain),str(peak)))
             if peak>=ARM_PCT:
                 summary["armed"]+=1
                 trailing_exit=max(MIN_GAIN_PCT,peak-GIVEBACK_POINTS)
