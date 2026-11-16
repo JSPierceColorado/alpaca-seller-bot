@@ -54,6 +54,18 @@ class HighWaterTrackerTests(unittest.TestCase):
         self.assertEqual(Decimal(r["peak_gain_pct"]),Decimal("21"))
         self.assertEqual(self.state()[0]["peak_gain_pct"],"21.00")
 
+    def test_all_observations_remain_for_future_giveback_analysis(self):
+        self.observe([pos(price="108")])
+        self.observe([pos(price="117")])
+        self.observe([pos(price="114")])
+        with hwm.connect(self.path) as db:
+            rows=[dict(r) for r in db.execute(
+                "SELECT gain_pct,peak_gain_pct FROM peak_samples ORDER BY id")]
+        self.assertEqual([Decimal(r["gain_pct"]) for r in rows],
+                         [Decimal("8"),Decimal("17"),Decimal("14")])
+        self.assertEqual([Decimal(r["peak_gain_pct"]) for r in rows],
+                         [Decimal("8"),Decimal("17"),Decimal("17")])
+
     def test_shadow_giveback_is_observation_not_trade(self):
         self.observe([pos(price="113")])
         a=self.observe([pos(price="110")])
