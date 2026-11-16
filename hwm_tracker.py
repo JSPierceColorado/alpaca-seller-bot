@@ -8,6 +8,7 @@ rebase the tracked position rather than importing an old position's peak.
 from __future__ import annotations
 
 import logging
+from contextlib import closing
 import os
 import re
 import sqlite3
@@ -46,6 +47,8 @@ def connect(path=DB_PATH):
         symbol TEXT NOT NULL, first_seen TEXT NOT NULL,
         last_seen TEXT NOT NULL, ended_at TEXT NOT NULL,
         peak_gain_pct TEXT NOT NULL, reason TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS tracker_meta(
+        key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
     connection.commit()
     return connection
 
@@ -98,9 +101,22 @@ def observe(positions, *, path=DB_PATH, at=None):
             else:
                 valid[symbol]=info
     if not all_equity:
-        LOG.info("HWM_SNAPSHOT_EMPTY preserve_prior_records=TRUE")
+        with closing(connect(path)) as conn, conn:
+            old=conn.execute("SELECT value FROM tracker_meta WHERE key='empty_observations'").fetchone()
+            consecutive=int(old["value"]) if old else 0
+            consecutive+=1
+            conn.execute("INSERT OR REPLACE INTO tracker_meta VALUES('empty_observations',?)",(str(consecutive),))
+            if consecutive>=2:
+                for row in conn.execute("SELECT * FROM active_peaks"):
+                    conn.execute("INSERT INTO archived_peaks VALUES(?,?,?,?,?,?)",
+                        (row["symbol"],row["first_seen"],row["last_seen"],stamp,
+                         row["peak_gain_pct"],"POSITION_ABSENT_TWICE"))
+                    summary["disappeared"]+=1
+                conn.execute("DELETE FROM active_peaks")
+        LOG.info("HWM_SNAPSHOT_EMPTY consecutive=%s disappeared=%d",consecutive,summary["disappeared"])
         return summary
-    with connect(path) as conn:
+    with closing(connect(path)) as conn, conn:
+        conn.execute("INSERT OR REPLACE INTO tracker_meta VALUES('empty_observations','0')")
         known={row["symbol"]:row for row in conn.execute("SELECT * FROM active_peaks")}
         for symbol,info in valid.items():
             summary["observed"]+=1
