@@ -89,7 +89,7 @@ class HighWaterTrackerTests(unittest.TestCase):
         self.assertEqual(a["disappeared"],1)
         self.assertEqual([r["symbol"] for r in self.state()],["MSFT"])
         self.observe([pos(price="105"),pos("MSFT",price="104")])
-        self.assertEqual(self.state()[1]["peak_gain_pct"],"5.00")
+        self.assertEqual(next(r for r in self.state() if r["symbol"]=="KO")["peak_gain_pct"],"5.00")
 
     def test_two_empty_observations_required_before_clearing(self):
         self.observe([pos(price="121")])
