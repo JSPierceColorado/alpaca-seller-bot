@@ -140,6 +140,31 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(a["submitted"],0)
 
 
+    def test_protected_core_etfs_never_sell_at_any_gain_or_loss(self):
+        for symbol in ("VT","SGOV"):
+            for price in ("40","100","110","113","120","150"):
+                p=pos(sym=symbol,price=price,pnl=str(Decimal(price)/100-1))
+                self.seed_peak(p,peak_price="150")
+                self.assertIsNone(main.exit_trigger(
+                    p,symbol,main.hwm_tracker.active_peak_records(path=self.dbpath).get(symbol)))
+                broker=FakeClient([p])
+                with patch.dict(sys.modules,sdk_stub()):
+                    result=main.check_once(broker,dry_run=False,now=NOW)
+                self.assertEqual(result["submitted"],0,(symbol,price))
+                self.assertEqual(broker.submitted,[])
+
+    def test_protected_and_regular_profitable_in_same_cycle(self):
+        core=pos(sym="VT",price="110",pnl=".10")
+        regular=pos(sym="UPST",price="110",pnl=".10")
+        self.seed_peak(core,peak_price="113")
+        self.seed_peak(regular,peak_price="113")
+        broker=FakeClient([core,regular])
+        with patch.dict(sys.modules,sdk_stub()):
+            result=main.check_once(broker,dry_run=False,now=NOW)
+        self.assertEqual(result["submitted"],1)
+        self.assertEqual(len(broker.submitted),1)
+        self.assertEqual(broker.submitted[0]["symbol"],"UPST")
+
     def test_no_loss_based_exit_for_any_equity_even_deep_drawdowns(self):
         for symbol in ("KO","QLYS","AMRC","TTMI","UPST"):
             for price in ("95","94","50","1"):
