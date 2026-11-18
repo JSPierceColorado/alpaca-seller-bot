@@ -467,6 +467,8 @@ def dashboard(rep,rangeval):
         recent=[x for x in history if x["date"]>=cutoff]
         if len(recent)>1:history=recent
     a=rep["account"];t=rep["trades"];b=rep["benchmark"]
+    currency=lambda v:"—" if v is None else "$"+format(float(v),",.2f")
+    percent=lambda v:"—" if v is None else format(float(v),".2f")+"%"
     core=rep.get("core_comparison",{})
     core_ready=core.get("status")=="ready"
     core_status=("Ready: core "+percent(core.get("core_return_pct"))+
@@ -484,8 +486,6 @@ def dashboard(rep,rangeval):
        graph(core.get("series",[]),[("core_index","VT + SGOV core"),
                                  ("active_index","Active remainder")])+
        '</section>')
-    currency=lambda v:"—" if v is None else "$"+format(float(v),",.2f")
-    percent=lambda v:"—" if v is None else format(float(v),".2f")+"%"
     def box(title,v,detail=""):return '<div class="card"><small>'+html.escape(title)+'</small><b>'+html.escape(str(v))+'</b><small>'+html.escape(detail)+'</small></div>'
     vals=[
       ("Total equity",currency(a["equity"])),("Unrealized P&L",currency(a["unrealized"])),
