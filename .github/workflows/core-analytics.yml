@@ -1,0 +1,21 @@
+name: Core vs Active analytics reliability
+on:
+  pull_request:
+    branches: [performance-analytics]
+  push:
+    branches: [performance-analytics]
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install analytics requirements
+        run: python -m pip install -r analytics/requirements.txt
+      - name: Compile analytics
+        run: python -m compileall -q analytics/main.py analytics/core_comparison.py
+      - name: Test core attribution
+        working-directory: analytics
+        run: python -m unittest discover -s tests -v

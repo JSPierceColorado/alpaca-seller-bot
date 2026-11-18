@@ -6,6 +6,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
+import core_comparison
 
 NY=ZoneInfo("America/New_York")
 LOG=logging.getLogger("analytics")
@@ -380,6 +381,9 @@ def report():
             if not last:return {"status":"awaiting_first_snapshot"}
             acct=dict(last)
             positions=[json.loads(x["data"]) for x in c.execute("SELECT data FROM positions WHERE day=?",(last["day"],))]
+            core_positions=defaultdict(dict)
+            for x in c.execute("SELECT day,symbol,data FROM positions WHERE symbol IN ('VT','SGOV')"):
+                core_positions[x["day"]][x["symbol"]]=json.loads(x["data"])
             acts=[json.loads(x["data"]) for x in c.execute("SELECT data FROM activities")]
             ids={x["id"]:x["cid"] for x in c.execute("SELECT id,cid FROM orders")}
             equities=[(x["day"],x["value"]) for x in c.execute("SELECT day,value FROM equity ORDER BY day")]
@@ -404,6 +408,11 @@ def report():
     history=[{"date":d,"equity":round(e,2)} for d,e in equities if e>0]
     series,drawdown,benchmark_issues=verified_spy_benchmark(
         account_rows,spy,acts,startday,bool(quality.get("activities_complete")))
+    core=core_comparison.compare(
+        completed_daily_snapshots(account_rows),core_positions,acts,ids,
+        dateval=dateval,
+        activity_complete=bool(quality.get("activities_complete")),
+        account_reconciled=bool(series))
     benchmark_status=("ready" if series else
                       "suspended_reconciliation" if benchmark_issues and any(
                           x not in ("NEED_TWO_COMPLETED_MARKET_DAYS","BASELINE_CLOSING_SNAPSHOT_MISSING")
@@ -423,7 +432,7 @@ def report():
     return {"status":"ok","as_of":acct["updated"],"account":{"day":acct["day"],"equity":round(acct["equity"],2),"cash":round(acct["cash"],2),"unrealized":round(acct["unrealized"],2),"positions":len(positions)},
       "positions":[{"symbol":x.get("symbol"),"qty":x.get("qty"),"value":float(dec(x.get("market_value"))),"unrealized":float(dec(x.get("unrealized_pl")))} for x in positions],
       "trades":covered,"benchmark":{"baseline":series[0]["date"],"last":series[-1],"max_drawdown_pct_est":dd} if series else None,
-      "series":series,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday,
+      "series":series,"core_comparison":core,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday,
       "benchmark_status":benchmark_status,"benchmark_issues":benchmark_issues},"last_error":LATEST_ERROR}
 
 def graph(points,keys):
@@ -460,6 +469,23 @@ def dashboard(rep,rangeval):
     a=rep["account"];t=rep["trades"];b=rep["benchmark"]
     currency=lambda v:"—" if v is None else "$"+format(float(v),",.2f")
     percent=lambda v:"—" if v is None else format(float(v),".2f")+"%"
+    core=rep.get("core_comparison",{})
+    core_ready=core.get("status")=="ready"
+    core_status=("Ready: core "+percent(core.get("core_return_pct"))+
+                  " vs active "+percent(core.get("active_return_pct"))
+                  if core_ready else "Not ready: "+str(core.get("reason","unknown")))
+    core_section=(
+       '<section class="panel"><h2>Long-term Compounder vs trading remainder</h2>'
+       '<p class="muted">Actual VT and SGOV holdings versus the account remainder, '
+       'both rebased to 100 on the first completed core holding day. '
+       'External deposits are removed as flows; core ETF purchases are '
+       'internal transfers. No return is shown until broker fills and '
+       'after-close balances reconcile. The active remainder includes cash '
+       'and any manual positions, not only ATLAS trades.</p><p>'+
+       html.escape(core_status)+'</p>'+
+       graph(core.get("series",[]),[("core_index","VT + SGOV core"),
+                                 ("active_index","Active remainder")])+
+       '</section>')
     def box(title,v,detail=""):return '<div class="card"><small>'+html.escape(title)+'</small><b>'+html.escape(str(v))+'</b><small>'+html.escape(detail)+'</small></div>'
     vals=[
       ("Total equity",currency(a["equity"])),("Unrealized P&L",currency(a["unrealized"])),
@@ -477,6 +503,7 @@ def dashboard(rep,rangeval):
       +'<section class="panel"><h2>Broker-reported total equity history</h2><p class="muted">Account equity includes deposits and withdrawals; this is not a return chart.</p>'+graph(history,[("equity","Alpaca equity")])+'</section>'
       +'<section class="panel"><h2>SPY comparison verification</h2><p class="muted">Status: '+html.escape(rep["quality"]["benchmark_status"])+'; funding is excluded from investment performance. If deposits or cash activity cannot be reconciled, the return graphs remain unavailable.</p></section>'
       +'<section class="panel"><h2>Cash-flow-adjusted return index (start = 100)</h2><p class="muted">Approximate daily time-weighted Alpaca performance vs SPY dividend-adjusted return.</p>'+graph(p,[("account_index","Alpaca"),("spy_index","SPY")])+'</section>'
+      +core_section
       +'<section class="panel"><h2>Actual equity vs hypothetical SPY equity</h2><p class="muted">Same starting balance and recorded deposits/withdrawals. Baseline '+html.escape(b["baseline"] if b else "pending")+'.</p>'+graph(p,[("equity","Alpaca"),("spy_equity","SPY")])+'</section>'
       +'<section class="panel"><h2>Net P&L after external cash flows</h2>'+graph(p,[("account_net","Alpaca"),("spy_net","SPY")])+'</section>'
       +'<section class="panel"><h2>Covered realized P&L by purchase source</h2><pre>'+html.escape(json.dumps(t["source_realized"],indent=2))+'</pre></section>'

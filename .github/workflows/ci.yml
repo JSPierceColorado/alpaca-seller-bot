@@ -11,7 +11,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install analytics requirements
+        run: python -m pip install -r analytics/requirements.txt
       - name: Run offline tests
         run: python -m unittest discover -s tests -v
       - name: Check Python syntax
         run: python -m compileall -q main.py
+      - name: Verify core portfolio percentage attribution
+        working-directory: analytics
+        run: python -m unittest discover -s tests -v
+      - name: Compile performance analytics
+        run: python -m compileall -q analytics/main.py analytics/core_comparison.py

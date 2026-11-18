@@ -5,6 +5,9 @@
 This is a **read-only, password-protected** service. It cannot submit orders or transfers and does not modify any existing trading bot. HTTP requests to Alpaca are GET-only; account credentials are referenced from the existing V2-Buyer service.
 
 Features:
+- **Core Compounder versus Active Remainder:** additional read-only dashboard chart with two after-close **flow-adjusted percent return indexes**, both rebased to 100 at the first verified VT/SGOV core purchase day. Confirms broker FILL activity belongs to deterministic v2core- order IDs, marks actual VT/SGOV holdings and their dividends, treats each confirmed ETF purchase as an internal transfer from Active to Core, and removes account deposits/withdrawals from Active investment returns. The Active remainder includes cash and any discretionary holdings, not exclusively ATLAS/V2.
+- The comparison is displayed **only** when at least two completed close snapshots, complete account activities, reconciled original SPY account cashflow, matching core ETF quantities and all corresponding core order IDs exist. Any suspicious manual ETF fill or missing broker activity suppresses the return indices and reports a reason.
+- **Fundamental limitation:** both sleeves share one Alpaca margin account. Trading losses, margin calls, broker liquidation, and use of pooled dividend cash can affect the holdings. This index is a fairer virtual accounting comparison, not separate secured assets or risk-isolated returns.
 - Persistent SQLite snapshots on Railway volume at /data
 - Portfolio equity, cash, current positions and unrealized P&L
 - Broker FILL history, approximate FIFO realized P&L, covered sell-order win rate, gross gains/losses and profit factor
