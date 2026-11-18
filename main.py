@@ -31,6 +31,7 @@ SP100_SHEET_ID="14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ"
 Q9=Decimal("0.000000001")
 SYMBOL=re.compile(r"^[A-Z][A-Z0-9.\-]{0,10}$")
 MAX_OPEN=500
+CORE_EXCLUDED_SYMBOLS=frozenset({"VT","SGOV"})  # Never sell core ETF holdings.
 
 
 def flag(name,default):
@@ -102,7 +103,9 @@ def profit_floor_limit(position):
 
 
 def exit_trigger(position,symbol,peak=None):
-    """Profit-only exit: losses NEVER authorize a sell for any symbol."""
+    """Only trailing profits; never sell the deposit-funded VT/SGOV core."""
+    if str(symbol).upper() in CORE_EXCLUDED_SYMBOLS:
+        return None
     if position_giveback_trigger(position,peak):
         return "GAIN_TRAILING_3PTS_MIN_10PCT"
     return None
@@ -256,6 +259,9 @@ def check_once(client,*,dry_run,now=None):
     previews=0
     for p in positions:
         sym=str(getattr(p,"symbol","")).upper()
+        if sym in CORE_EXCLUDED_SYMBOLS:
+            LOG.info("SELL_CORE_EXCLUDED symbol=%s policy=NEVER_SELL",sym)
+            continue
         if not SYMBOL.fullmatch(sym):continue
         cls=str(getattr(getattr(p,"asset_class",None),"value",getattr(p,"asset_class",None))).lower()
         side=str(getattr(getattr(p,"side",None),"value",getattr(p,"side",None))).lower()
@@ -402,7 +408,7 @@ def main():
         replace_existing=True)
     LOG.info("HWM_OBSERVER_STARTED interval=10min market_hours=TRUE peak_tracking=TRUE giveback_points=3")
     LOG.info("V2_SELLER_STARTED schedule=09:35..15:35 America/New_York"
-             " every_hour=TRUE profit_arm=13pct giveback=3pts profit_floor_limit=10pct stop_loss=DISABLED_ALL_SYMBOLS mode=%s dry_run=%s",
+             " every_hour=TRUE profit_arm=13pct giveback=3pts profit_floor_limit=10pct stop_loss=DISABLED_ALL_SYMBOLS protected_core=VT,SGOV NEVER_SELL mode=%s dry_run=%s",
              "PAPER" if paper else "LIVE",dry)
     scheduler.start()
 
