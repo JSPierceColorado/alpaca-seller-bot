@@ -61,7 +61,10 @@ def sdk_stub():
     modules["alpaca.trading.enums"].OrderSide=SimpleNamespace(SELL="sell")
     modules["alpaca.trading.enums"].TimeInForce=SimpleNamespace(DAY="day")
     modules["alpaca.trading.requests"].GetOrdersRequest=OrderRequest
-    modules["alpaca.trading.requests"].MarketOrderRequest=OrderRequest
+    class ForbiddenMarketSell:
+        def __init__(self,**kwargs):
+            raise AssertionError("Profit-only seller may never construct a market sell")
+    modules["alpaca.trading.requests"].MarketOrderRequest=ForbiddenMarketSell
     modules["alpaca.trading.requests"].LimitOrderRequest=OrderRequest
     modules["alpaca.common.exceptions"].APIError=APIError
     return modules
@@ -137,13 +140,17 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(a["submitted"],0)
 
 
-    def test_stop_loss_threshold_uses_both_broker_ratio_and_cost(self):
-        self.assertTrue(main.position_stop_loss_trigger(pos(sym="ABCD",price="95",pnl="-0.05")))
-        self.assertTrue(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="-0.06")))
-        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="95.1",pnl="-0.049")))
-        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="-0.04")))
-        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="96",pnl="-0.06")))
-        self.assertFalse(main.position_stop_loss_trigger(pos(sym="ABCD",price="94",pnl="NaN")))
+    def test_no_loss_based_exit_for_any_equity_even_deep_drawdowns(self):
+        for symbol in ("KO","QLYS","AMRC","TTMI","UPST"):
+            for price in ("95","94","50","1"):
+                p=pos(sym=symbol,price=price,
+                      pnl=str(Decimal(price)/Decimal(100)-1))
+                self.assertIsNone(main.exit_trigger(p,symbol))
+                broker=FakeClient([p])
+                with patch.dict(sys.modules,sdk_stub()):
+                    result=main.check_once(broker,dry_run=False,now=NOW)
+                self.assertEqual(result["submitted"],0,(symbol,price))
+                self.assertEqual(broker.submitted,[])
 
     def test_sp100_losing_stock_never_stopped(self):
         client=FakeClient([pos(sym="KO",price="60",pnl="-.4")])
@@ -152,16 +159,14 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(report["eligible"],0)
         self.assertEqual(client.submitted,[])
 
-    def test_non_sp100_loss_triggers_full_sell_once(self):
+    def test_non_sp100_loss_never_triggers_sell_even_at_threshold(self):
         client=FakeClient([pos(sym="QLYS",price="95",pnl="-.05",qty="0.512345678")])
         with patch.dict(sys.modules,sdk_stub()):
             first=main.check_once(client,dry_run=False,now=NOW)
             second=main.check_once(client,dry_run=False,now=NOW)
-        self.assertEqual(first["submitted"],1)
+        self.assertEqual(first["submitted"],0)
         self.assertEqual(second["submitted"],0)
-        self.assertEqual(len(client.submitted),1)
-        self.assertEqual(client.submitted[0]["qty"],0.512345678)
-        self.assertEqual(client.submitted[0]["client_order_id"],"v2sl-20261109-QLYS")
+        self.assertEqual(client.submitted,[])
 
     def test_non_sp100_does_not_stop_before_five_percent(self):
         client=FakeClient([pos(sym="QLYS",price="95.5",pnl="-.045")])
@@ -169,15 +174,19 @@ class SellerTests(unittest.TestCase):
             report=main.check_once(client,dry_run=False,now=NOW)
         self.assertEqual(report["submitted"],0)
 
-    def test_unavailable_membership_disables_only_loss_exits(self):
+    def test_seller_does_not_need_sp100_membership_to_take_profit(self):
         client=FakeClient([pos(sym="QLYS",price="80",pnl="-.20"),
-                           pos(sym="KO",price="110",pnl=".10")])
+                           pos(sym="UPST",price="110",pnl=".10")])
         self.seed_peak(client.positions[1],peak_price="113")
-        with patch.object(main,"load_sp100_membership",side_effect=RuntimeError("offline")):
+        with patch.object(main,"load_sp100_membership",
+                          side_effect=RuntimeError("offline")) as membership:
             with patch.dict(sys.modules,sdk_stub()):
                 report=main.check_once(client,dry_run=False,now=NOW)
+        membership.assert_not_called()
         self.assertEqual(report["submitted"],1)
-        self.assertEqual(client.submitted[0]["symbol"],"KO")
+        self.assertEqual(client.submitted[0]["symbol"],"UPST")
+        self.assertEqual(client.submitted[0]["client_order_id"],"v2sg-20261109-UPST")
+        self.assertIn("limit_price",client.submitted[0])
 
 
     def test_seller_order_ids_label_stop_not_profit(self):
@@ -188,9 +197,11 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(len(main.daily_sell_ids("2026-11-16","TTMI")),3)
         self.assertIn("v2s-20261116-TTMI",main.daily_sell_ids("2026-11-16","TTMI"))
 
-    def test_profit_and_stop_share_daily_idempotency(self):
-        client=FakeClient([pos(sym="QLYS",price="94",pnl="-.06")])
-        client.clientids.add("v2sg-20261109-QLYS")
+    def test_historical_stop_id_prevents_same_day_duplicate_profit_sell(self):
+        position=pos(sym="QLYS",price="110",pnl=".10")
+        client=FakeClient([position])
+        self.seed_peak(position,peak_price="113")
+        client.clientids.add("v2sl-20261109-QLYS")
         with patch.dict(sys.modules,sdk_stub()):
             result=main.check_once(client,dry_run=False,now=NOW)
         self.assertEqual(result["submitted"],0)
@@ -242,15 +253,14 @@ class SellerTests(unittest.TestCase):
         self.assertEqual(main.profit_floor_limit(pos(price="0.95",cost="0.8",pnl=".1875")),Decimal(".88"))
         self.assertEqual(main.profit_floor_limit(pos(price="1.20",cost="1.01",pnl=".188")),Decimal("1.12"))
 
-    def test_storage_unavailable_disables_profit_but_not_stop_loss(self):
+    def test_storage_unavailable_disables_all_exits_without_profit_proof(self):
         client=FakeClient([pos(sym="KO",price="110",pnl=".10"),
                            pos(sym="QLYS",price="94",pnl="-.06")])
         with patch.dict(sys.modules,sdk_stub()),patch.object(
             main.hwm_tracker,"active_peak_records",side_effect=OSError("disk unavailable")):
             out=main.check_once(client,dry_run=False,now=NOW)
-        self.assertEqual(out["submitted"],1)
-        self.assertEqual(client.submitted[0]["symbol"],"QLYS")
-        self.assertNotIn("limit_price",client.submitted[0])
+        self.assertEqual(out["submitted"],0)
+        self.assertEqual(client.submitted,[])
 
     def test_buy_addition_rebases_and_rejects_old_peak(self):
         current=pos(price="111",pnl=".11",qty="1")
