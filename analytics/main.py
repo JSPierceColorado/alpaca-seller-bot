@@ -14,6 +14,10 @@ DATA="/data/performance.sqlite3"
 LOCK=threading.RLock()
 RUN=threading.Lock()
 LATEST_ERROR=""
+# Immutable production trade-statistics cutoff: Nov 25 2026 13:58 Denver time.
+# Historical fills are retained solely to reconstruct cost basis of held shares.
+METRICS_START_UTC="2026-11-25T20:58:00Z"
+METRICS_START_DAY=METRICS_START_UTC[:10]
 
 def dec(v):
     try:
@@ -29,6 +33,15 @@ def dateval(v):
         t=datetime.fromisoformat(v.replace("Z","+00:00"))
         return t.astimezone(NY).date().isoformat()
     except Exception:return None
+
+def utc_datetime(value):
+    """Return aware UTC time or None; never guess the time of a broker fill."""
+    try:
+        stamp=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+    except (ValueError,TypeError,OverflowError):
+        return None
+
 
 def priceday(value):
     """Daily bar timestamps represent their source trading date in UTC."""
@@ -340,25 +353,46 @@ def verified_spy_benchmark(account_rows,spy,activities,startday,activities_compl
     return series,round(float(max_dd*100),2),[]
 
 
-def fifo(acts,ids):
-    inventory=defaultdict(deque);sold=defaultdict(lambda:{"pnl":Decimal(0),"unknown":False,"matched":False,"by_source":defaultdict(lambda:Decimal(0))})
-    fills=sorted((x for x in acts if x.get("activity_type")=="FILL"),key=lambda x:(str(x.get("transaction_time")),str(x.get("id"))))
+def fifo(acts,ids,start_utc=None):
+    """Only post-cutoff sell fills contribute to stats; old fills maintain cost basis."""
+    cutoff=utc_datetime(start_utc) if start_utc is not None else None
+    if start_utc is not None and cutoff is None:
+        raise ValueError("INVALID_METRICS_START_UTC")
+    inventory=defaultdict(deque)
+    sold=defaultdict(lambda:{"pnl":Decimal(0),"unknown":False,"matched":False,
+                             "by_source":defaultdict(lambda:Decimal(0))})
+    fills=sorted((x for x in acts if x.get("activity_type")=="FILL"),
+                 key=lambda x:(utc_datetime(x.get("transaction_time")) or
+                               datetime.min.replace(tzinfo=timezone.utc),
+                               str(x.get("id"))))
+    fresh_fills=0;unverifiable_timestamps=0
     for x in fills:
-        sym=str(x.get("symbol") or "").upper();qty=dec(x.get("qty"));price=dec(x.get("price"))
+        stamp=utc_datetime(x.get("transaction_time"))
+        if cutoff is not None and stamp is None:
+            unverifiable_timestamps+=1
+            continue
+        sym=str(x.get("symbol") or "").upper()
+        qty=dec(x.get("qty"));price=dec(x.get("price"))
         if not sym or qty<=0 or price<=0:continue
         order=str(x.get("order_id") or x.get("id"));cid=ids.get(order,"")
         source="V2" if cid.startswith("v2b-") else ("ATLAS" if cid.startswith("aitr-") else "Other")
         side=str(x.get("side") or "").lower()
-        if side=="buy":inventory[sym].append([qty,price,source])
+        current=(cutoff is None or stamp>=cutoff)
+        if current:fresh_fills+=1
+        if side=="buy":
+            inventory[sym].append([qty,price,source])
         elif side=="sell":
             remaining=qty
             while remaining>0 and inventory[sym]:
-                lot=inventory[sym][0];taken=min(remaining,lot[0]);gain=taken*(price-lot[1])
-                sold[order]["pnl"]+=gain;sold[order]["matched"]=True
-                sold[order]["by_source"][lot[2]]+=gain
+                lot=inventory[sym][0];taken=min(remaining,lot[0])
+                if current:
+                    gain=taken*(price-lot[1])
+                    sold[order]["pnl"]+=gain
+                    sold[order]["matched"]=True
+                    sold[order]["by_source"][lot[2]]+=gain
                 remaining-=taken;lot[0]-=taken
                 if lot[0]<=0:inventory[sym].popleft()
-            if remaining>0:sold[order]["unknown"]=True
+            if current and remaining>0:sold[order]["unknown"]=True
     groups=[x for x in sold.values() if x["matched"] and not x["unknown"]]
     win=sum(x["pnl"]>0 for x in groups);loss=sum(x["pnl"]<0 for x in groups)
     plus=sum((max(x["pnl"],Decimal(0)) for x in groups),Decimal(0))
@@ -366,12 +400,16 @@ def fifo(acts,ids):
     sources=defaultdict(lambda:Decimal(0))
     for group in groups:
         for source,value in group["by_source"].items():sources[source]+=value
-    return {"closed_orders":len(groups),"wins":win,"losses":loss,"breakeven":len(groups)-win-loss,"win_rate":round(win/(win+loss)*100,2) if win+loss else None,
+    return {"period_start_utc":start_utc,
+      "closed_orders":len(groups),"wins":win,"losses":loss,
+      "breakeven":len(groups)-win-loss,
+      "win_rate":round(win/(win+loss)*100,2) if win+loss else None,
       "realized":round(float(sum((x["pnl"] for x in groups),Decimal(0))),2),
       "gross_wins":round(float(plus),2),"gross_losses":round(float(minus),2),
       "profit_factor":round(float(plus/minus),3) if minus else None,
       "unmatched_sells":sum(x["unknown"] for x in sold.values()),
-      "source_realized":{k:round(float(v),2) for k,v in sources.items()},"fill_records":len(fills)}
+      "source_realized":{k:round(float(v),2) for k,v in sources.items()},
+      "fill_records":fresh_fills,"unverifiable_fill_timestamps":unverifiable_timestamps}
 
 def report():
     with LOCK:
@@ -394,7 +432,7 @@ def report():
             q=c.execute("SELECT val FROM meta WHERE key='quality'").fetchone()
             quality=json.loads(q["val"]) if q else {}
             baseline_row=c.execute("SELECT val FROM meta WHERE key='benchmark_start'").fetchone()
-            startday=baseline_row["val"] if baseline_row else acct["day"]
+            startday=max(baseline_row["val"],METRICS_START_DAY) if baseline_row else METRICS_START_DAY
         finally:c.close()
     transfers=0;new_transfers=0
     for a in acts:
@@ -404,12 +442,21 @@ def report():
             transfers+=1
             at_day=dateval(a.get("transaction_time") or a.get("date"))
             if at_day and at_day>startday:new_transfers+=1
-    covered=fifo(acts,ids)
-    history=[{"date":d,"equity":round(e,2)} for d,e in equities if e>0]
+    covered=fifo(acts,ids,start_utc=METRICS_START_UTC)
+    history=[{"date":d,"equity":round(e,2)} for d,e in equities if e>0 and d>=METRICS_START_DAY]
     series,drawdown,benchmark_issues=verified_spy_benchmark(
         account_rows,spy,acts,startday,bool(quality.get("activities_complete")))
+    # Do not show a pre-reset core/active performance series as fresh returns.
+    core_closes=[x for x in completed_daily_snapshots(account_rows) if x["date"]>=startday]
+    core_positions_fresh={d:p for d,p in core_positions.items() if d>=startday}
+    cutoff_ts=utc_datetime(METRICS_START_UTC)
+    core_acts=[x for x in acts if
+               ((utc_datetime(x.get("transaction_time")) is not None and
+                 utc_datetime(x.get("transaction_time"))>=cutoff_ts) or
+                (not x.get("transaction_time") and
+                 (dateval(x.get("date")) or "")>METRICS_START_DAY))]
     core=core_comparison.compare(
-        completed_daily_snapshots(account_rows),core_positions,acts,ids,
+        core_closes,core_positions_fresh,core_acts,ids,
         dateval=dateval,
         activity_complete=bool(quality.get("activities_complete")),
         account_reconciled=bool(series))
@@ -418,8 +465,12 @@ def report():
                           x not in ("NEED_TWO_COMPLETED_MARKET_DAYS","BASELINE_CLOSING_SNAPSHOT_MISSING")
                           for x in benchmark_issues) else "awaiting_closing_data")
     dd=drawdown if drawdown is not None else None
-    warnings=["Observed FIFO realized P&L is provisional, before fees/taxes, not authoritative tax-lot accounting.",
+    warnings=["Trade win rate and realized profit statistics start at "+METRICS_START_UTC+
+              "; old sales excluded, prior purchases used only for cost basis.",
+      "Observed FIFO realized P&L is provisional, before fees/taxes, not authoritative tax-lot accounting.",
       "Matched-cashflow SPY portfolio is hypothetical, with IEX adjusted close prices and end-of-day external flows."]
+    if covered["unverifiable_fill_timestamps"]:
+        warnings.append("Unverifiable fill timestamps excluded: "+str(covered["unverifiable_fill_timestamps"]))
     if not quality.get("activities_complete"):warnings.append("Activity history is incomplete; exclude unverified results from decisions.")
     if not quality.get("orders_complete"):warnings.append("Order history incomplete; bot attribution may be missing.")
     if covered["unmatched_sells"]:warnings.append("Sells without observed matching buy lots excluded from realized results and win rate.")
@@ -433,7 +484,8 @@ def report():
       "positions":[{"symbol":x.get("symbol"),"qty":x.get("qty"),"value":float(dec(x.get("market_value"))),"unrealized":float(dec(x.get("unrealized_pl")))} for x in positions],
       "trades":covered,"benchmark":{"baseline":series[0]["date"],"last":series[-1],"max_drawdown_pct_est":dd} if series else None,
       "series":series,"core_comparison":core,"account_history":history,"quality":{"checks":quality,"warnings":warnings,"benchmark_start":startday,
-      "benchmark_status":benchmark_status,"benchmark_issues":benchmark_issues},"last_error":LATEST_ERROR}
+      "benchmark_status":benchmark_status,"benchmark_issues":benchmark_issues,
+       "metrics_start_utc":METRICS_START_UTC},"last_error":LATEST_ERROR}
 
 def graph(points,keys):
     if len(points)<2:return '<p class="muted">Not enough comparable observations.</p>'
@@ -499,6 +551,7 @@ def dashboard(rep,rangeval):
     warnings="".join("<li>"+html.escape(x)+"</li>" for x in rep["quality"]["warnings"])
     return ('<header><p class="accent">READ ONLY · ALPACA ACCOUNT</p><h1>Investment Performance Control Center</h1><p class="muted">Broker snapshot '+html.escape(rep["as_of"])+'</p></header>'
       +'<section class="grid">'+boxes+'</section>'
+      +'<section class="panel"><h2>Fresh performance period</h2><p class="muted">Win rate, completed sell orders, realized P&amp;L, profit factor and source attribution count only sale fills at or after '+html.escape(METRICS_START_UTC)+'. Pre-reset purchases serve only as FIFO cost basis. Account equity and SPY comparison also restart from '+html.escape(METRICS_START_DAY)+'. Historical data is retained in the database, not mixed into the current statistics.</p></section>'
       +'<nav>'+nav+' <a href="/api/report">Full JSON</a> <a href="/api/summary">Summary API</a> <a href="/export/snapshots.csv">CSV</a> <a href="/refresh">Refresh now</a></nav>'
       +'<section class="panel"><h2>Broker-reported total equity history</h2><p class="muted">Account equity includes deposits and withdrawals; this is not a return chart.</p>'+graph(history,[("equity","Alpaca equity")])+'</section>'
       +'<section class="panel"><h2>SPY comparison verification</h2><p class="muted">Status: '+html.escape(rep["quality"]["benchmark_status"])+'; funding is excluded from investment performance. If deposits or cash activity cannot be reconciled, the return graphs remain unavailable.</p></section>'
@@ -553,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 c=connect()
                 try:
-                    for r in c.execute("SELECT * FROM account ORDER BY day"):
+                    for r in c.execute("SELECT * FROM account WHERE day>=? ORDER BY day",(METRICS_START_DAY,)):
                         w.writerow([r["day"],r["equity"],r["cash"],r["unrealized"],r["updated"]])
                 finally:c.close()
             self.send(sio.getvalue(),"text/csv");return
@@ -573,6 +626,7 @@ def main():
     scheduler.start()
     threading.Thread(target=refresh,daemon=True).start()
     port=int(os.getenv("PORT","8080"))
+    LOG.info("ANALYTICS_METRICS_RESET start_utc=%s retained_old_fills_for_cost_basis=TRUE",METRICS_START_UTC)
     LOG.info("ANALYTICS_SERVICE_STARTED read_only=TRUE port=%d cron=market_hourly_and_after_close",port)
     ThreadingHTTPServer(("0.0.0.0",port),Handler).serve_forever()
 

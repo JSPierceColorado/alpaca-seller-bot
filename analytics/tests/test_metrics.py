@@ -26,6 +26,54 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(r["unmatched_sells"],1)
         self.assertIsNone(r["win_rate"])
 
+    def test_reset_uses_old_buys_for_basis_but_no_old_sells(self):
+        data=[
+            {"id":"b","activity_type":"FILL","symbol":"KO","side":"buy","qty":"3","price":"100","order_id":"b","transaction_time":"2026-11-20T18:00:00Z"},
+            {"id":"pre","activity_type":"FILL","symbol":"KO","side":"sell","qty":"1","price":"200","order_id":"pre","transaction_time":"2026-11-25T20:57:59Z"},
+            {"id":"win","activity_type":"FILL","symbol":"KO","side":"sell","qty":"1","price":"110","order_id":"win","transaction_time":"2026-11-25T15:58:00-05:00"},
+            {"id":"loss","activity_type":"FILL","symbol":"KO","side":"sell","qty":"1","price":"95","order_id":"loss","transaction_time":"2026-11-27T15:00:00Z"}]
+        r=main.fifo(data,{"b":"v2b-20261120-KO"},main.METRICS_START_UTC)
+        self.assertEqual(r["period_start_utc"],"2026-11-25T20:58:00Z")
+        self.assertEqual((r["closed_orders"],r["wins"],r["losses"],r["win_rate"]),(2,1,1,50))
+        self.assertEqual(r["realized"],5)
+        self.assertEqual(r["gross_wins"],10)
+        self.assertEqual(r["gross_losses"],5)
+        self.assertEqual(r["profit_factor"],2)
+        self.assertEqual(r["source_realized"]["V2"],5)
+        self.assertEqual(r["fill_records"],2)
+
+    def test_reset_has_no_historical_win_rate_even_if_profitable(self):
+        old=[
+            {"id":"b","activity_type":"FILL","symbol":"ABC","side":"buy","qty":"1","price":"10","order_id":"b","transaction_time":"2026-11-23T00:00:00Z"},
+            {"id":"s","activity_type":"FILL","symbol":"ABC","side":"sell","qty":"1","price":"20","order_id":"s","transaction_time":"2026-11-25T20:57:00Z"}]
+        r=main.fifo(old,{},main.METRICS_START_UTC)
+        self.assertEqual(r["closed_orders"],0)
+        self.assertEqual(r["realized"],0)
+        self.assertEqual(r["fill_records"],0)
+        self.assertIsNone(r["win_rate"])
+        post={"id":"z","activity_type":"FILL","symbol":"ABC","side":"sell",
+              "qty":"1","price":"30","order_id":"z",
+              "transaction_time":"2026-11-25T20:59:00Z"}
+        r=main.fifo(old+[post],{},main.METRICS_START_UTC)
+        self.assertEqual(r["unmatched_sells"],1)
+        self.assertEqual(r["closed_orders"],0)
+        self.assertIsNone(r["win_rate"])
+
+    def test_partial_order_spanning_reset_only_counts_later_fill(self):
+        f=[
+            {"id":"b","activity_type":"FILL","symbol":"DEF","side":"buy","qty":"2","price":"10","order_id":"b","transaction_time":"2026-11-20T00:00:00Z"},
+            {"id":"s0","activity_type":"FILL","symbol":"DEF","side":"sell","qty":"1","price":"40","order_id":"s","transaction_time":"2026-11-25T20:57:59Z"},
+            {"id":"s1","activity_type":"FILL","symbol":"DEF","side":"sell","qty":"1","price":"12","order_id":"s","transaction_time":"2026-11-25T20:58:01Z"}]
+        r=main.fifo(f,{},main.METRICS_START_UTC)
+        self.assertEqual((r["closed_orders"],r["wins"],r["realized"]),(1,1,2))
+
+    def test_reset_never_guesses_missing_timestamps(self):
+        f=[{"id":"missing","activity_type":"FILL","symbol":"ABC","side":"sell",
+            "qty":"1","price":"20","order_id":"z","transaction_time":"not-a-date"}]
+        r=main.fifo(f,{},main.METRICS_START_UTC)
+        self.assertEqual(r["unverifiable_fill_timestamps"],1)
+        self.assertEqual(r["closed_orders"],0)
+
     def test_order_backfill_and_incremental_pagination(self):
         from unittest.mock import patch
         class DB:
